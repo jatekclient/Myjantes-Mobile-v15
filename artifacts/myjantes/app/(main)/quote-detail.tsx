@@ -216,7 +216,9 @@ export default function QuoteDetailScreen() {
   const hasNoContent = quoteItems.length === 0 && totalTTCNum === 0;
 
   const finalStatuses = new Set(["accepted", "accepté", "accepte", "rejected", "refusé", "refuse", "refused", "completed", "terminé", "termine", "cancelled", "annulé", "annule", "annulée", "annulee"]);
-  const canRespond = !isPending && !finalStatuses.has(statusLower);
+  // Le client peut répondre dès que le devis n'est pas dans un état final :
+  // "pending" (en attente de réponse) ET "sent" (envoyé) sont tous deux valides.
+  const canRespond = !finalStatuses.has(statusLower);
 
   const existingReservation = (allReservations as any[]).find(
     (r) => r.quoteId === id || r.quoteId === quote?.id
@@ -567,21 +569,17 @@ export default function QuoteDetailScreen() {
         ) : null}
 
         <View style={styles.footerActions}>
-          {viewToken && (
-            <>
-              <Pressable
-                style={({ pressed }) => [styles.btnSecondary, pressed && styles.btnSecondaryPressed, downloading && { opacity: 0.6 }]}
-                onPress={handleViewPdf}
-                disabled={downloading}
-              >
-                {downloading
-                  ? <ActivityIndicator size="small" color={theme.primary} />
-                  : <Ionicons name="eye-outline" size={18} color={theme.primary} />
-                }
-                <Text style={styles.btnSecondaryText}>{downloading ? "Chargement…" : "Visualiser le devis"}</Text>
-              </Pressable>
-            </>
-          )}
+          <Pressable
+            style={({ pressed }) => [styles.btnSecondary, pressed && styles.btnSecondaryPressed, downloading && { opacity: 0.6 }]}
+            onPress={handleViewPdf}
+            disabled={downloading}
+          >
+            {downloading
+              ? <ActivityIndicator size="small" color={theme.primary} />
+              : <Ionicons name="document-text-outline" size={18} color={theme.primary} />
+            }
+            <Text style={styles.btnSecondaryText}>{downloading ? "Chargement…" : "Visualiser / Télécharger le PDF"}</Text>
+          </Pressable>
 
           {canRespond && (
             <View style={styles.responseRow}>

@@ -629,11 +629,36 @@ export const quotesApi = {
   createReservation: (id: string, data: any) =>
     apiCall(`/api/mobile/quotes/${id}/create-reservation`, { method: "POST", body: data }),
 
-  accept: async (id: string) =>
-    apiCall(`/api/mobile/quotes/${id}`, { method: "PATCH", body: { status: "accepted" } }),
+  /**
+   * Accepter un devis.
+   * Essaie d'abord l'endpoint dédié POST /accept (certains backends l'exposent),
+   * puis repasse sur PATCH { status: "accepted" } si ce n'est pas disponible.
+   */
+  accept: async (id: string) => {
+    try {
+      return await apiCall(`/api/mobile/quotes/${id}/accept`, { method: "POST" });
+    } catch (err: any) {
+      if (err?.status === 404 || err?.status === 405) {
+        return apiCall(`/api/mobile/quotes/${id}`, { method: "PATCH", body: { status: "accepted" } });
+      }
+      throw err;
+    }
+  },
 
-  reject: async (id: string) =>
-    apiCall(`/api/mobile/quotes/${id}`, { method: "PATCH", body: { status: "rejected" } }),
+  /**
+   * Refuser un devis.
+   * Même logique de fallback que accept.
+   */
+  reject: async (id: string) => {
+    try {
+      return await apiCall(`/api/mobile/quotes/${id}/reject`, { method: "POST" });
+    } catch (err: any) {
+      if (err?.status === 404 || err?.status === 405) {
+        return apiCall(`/api/mobile/quotes/${id}`, { method: "PATCH", body: { status: "rejected" } });
+      }
+      throw err;
+    }
+  },
 };
 
 export interface ConfiguratorQuoteRequest {

@@ -386,21 +386,19 @@ export default function InvoiceDetailScreen() {
           </View>
         ) : null}
 
-        {viewToken && (
-          <View style={styles.footerActions}>
-            <Pressable
-              style={({ pressed }) => [styles.btnPdf, pressed && styles.btnPdfPressed, downloading && { opacity: 0.6 }]}
-              onPress={handleViewPdf}
-              disabled={downloading}
-            >
-              {downloading
-                ? <ActivityIndicator size="small" color={theme.primary} />
-                : <Ionicons name="eye-outline" size={18} color={theme.primary} />
-              }
-              <Text style={styles.btnPdfText}>{downloading ? "Chargement…" : "Visualiser la facture"}</Text>
-            </Pressable>
-          </View>
-        )}
+        <View style={styles.footerActions}>
+          <Pressable
+            style={({ pressed }) => [styles.btnPdf, pressed && styles.btnPdfPressed, downloading && { opacity: 0.6 }]}
+            onPress={handleViewPdf}
+            disabled={downloading}
+          >
+            {downloading
+              ? <ActivityIndicator size="small" color={theme.primary} />
+              : <Ionicons name="document-text-outline" size={18} color={theme.primary} />
+            }
+            <Text style={styles.btnPdfText}>{downloading ? "Chargement…" : "Visualiser / Télécharger le PDF"}</Text>
+          </Pressable>
+        </View>
         
       </ScrollView>
       {AlertComponent}
