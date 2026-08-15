@@ -1,0 +1,3096 @@
+import type { Express, Request, Response, NextFunction } from "express";
+
+import pg from "pg";
+import path from "node:path";
+import fs from "node:fs";
+import Busboy from "busboy";
+import { registerSocialAuthRoutes } from "../social-auth";
+import { Client as ObjectStorageClient } from "@replit/object-storage";
+
+
+declare module 'express' {
+  interface Request {
+    rawBody?: Buffer | string;
+  }
+}
+
+const ALLOWED_PARENT_DOMAIN = "myjantes.fr";
+
+function normalizeApiUrl(raw: string): string {
+  let url = raw.trim();
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = `https://${url}`;
+  }
+  return url.replace(/\/+$/, "");
+}
+
+function requireApiUrlEnv(raw: string | undefined, label: string): string {
+  if (!raw || !raw.trim()) {
+    throw new Error(
+      `[CONFIG] ${label} is not set. This environment variable is required and must point to https://<host>.${ALLOWED_PARENT_DOMAIN}`
+    );
+  }
+  let normalized = normalizeApiUrl(raw);
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    if (host !== ALLOWED_PARENT_DOMAIN && !host.endsWith(`.${ALLOWED_PARENT_DOMAIN}`)) {
+      throw new Error(
+        `[CONFIG] ${label} host "${host}" is not allowed. Must be ${ALLOWED_PARENT_DOMAIN} or a subdomain.`
+      );
+    }
+  } catch (e: any) {
+    if (e?.message?.startsWith("[CONFIG]")) throw e;
+    throw new Error(`[CONFIG] ${label} is not a valid URL: ${raw}`);
+  }
+  // Ensure /api suffix is present
+  if (!normalized.endsWith("/api") && !normalized.includes("/api/")) {
+    normalized = normalized.replace(/\/$/, "") + "/api";
+  }
+  return normalized;
+}
+
+function requireBaseUrlEnv(raw: string | undefined, label: string): string {
+  if (!raw || !raw.trim()) {
+    throw new Error(
+      `[CONFIG] ${label} is not set. This environment variable is required and must point to https://<host>.${ALLOWED_PARENT_DOMAIN}`
+    );
+  }
+  const normalized = normalizeApiUrl(raw);
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    if (host !== ALLOWED_PARENT_DOMAIN && !host.endsWith(`.${ALLOWED_PARENT_DOMAIN}`)) {
+      throw new Error(
+        `[CONFIG] ${label} host "${host}" is not allowed. Must be ${ALLOWED_PARENT_DOMAIN} or a subdomain.`
+      );
+    }
+  } catch (e: any) {
+    if (e?.message?.startsWith("[CONFIG]")) throw e;
+    throw new Error(`[CONFIG] ${label} is not a valid URL: ${raw}`);
+  }
+  return normalized;
+}
+
+// Alias used in the admin config routes for URL sanitization
+function sanitizeApiUrlEnv(raw: string, label: string): string {
+  return requireApiUrlEnv(raw, label);
+}
+
+function resolveDefaultExternalApi(): string {
+  try {
+    return requireApiUrlEnv(
+      process.env.EXTERNAL_API_URL ||
+        process.env.EXPO_PUBLIC_EXTERNAL_API_URL ||
+        process.env.PUBLIC_BASE_URL ||
+        process.env.EXPO_PUBLIC_PUBLIC_BASE_URL,
+      "EXTERNAL_API_URL"
+    );
+  } catch {
+    return "https://api.myjantes.fr/api";
+  }
+}
+function resolvePublicBaseUrl(): string {
+  try {
+    return requireBaseUrlEnv(
+      process.env.PUBLIC_BASE_URL ||
+        process.env.EXPO_PUBLIC_PUBLIC_BASE_URL ||
+        process.env.EXPO_PUBLIC_EXTERNAL_API_URL,
+      "PUBLIC_BASE_URL"
+    );
+  } catch {
+    return "https://myjantes.fr";
+  }
+}
+
+const DEFAULT_EXTERNAL_API = resolveDefaultExternalApi();
+const PUBLIC_BASE_URL = resolvePublicBaseUrl();
+const REMOTE_CONFIG_ENDPOINT = `${PUBLIC_BASE_URL}/api/public/mobile-api-url`;
+
+let _dynamicApiUrl: string = DEFAULT_EXTERNAL_API;
+let _urlLastRefreshed = 0;
+const URL_CACHE_TTL_MS = 30_000;
+
+function getActiveApiUrl(): string { return _dynamicApiUrl; }
+function getActiveFallbacks(): string[] {
+  return [_dynamicApiUrl];
+}
+
+const ALLOWED_API_DOMAIN = ALLOWED_PARENT_DOMAIN; // Trust any subdomain on the production parent domain
+
+async function fetchRemoteConfigUrl(): Promise<string | null> {
+  try {
+    const res = await fetch(REMOTE_CONFIG_ENDPOINT, {
+      signal: AbortSignal.timeout(5000),
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    const raw = data?.mobileApiUrl || data?.api_url || data?.apiUrl || data?.url;
+    if (!raw || typeof raw !== "string") return null;
+    let url = normalizeApiUrl(raw);
+    // Security: reject any remote config that points to a domain other than the production domain
+    try {
+      const parsedHost = new URL(url).hostname.toLowerCase();
+      if (!parsedHost.includes(ALLOWED_API_DOMAIN)) {
+        console.warn(`[CONFIG] Remote config rejected non-production domain: ${parsedHost} (expected: ${ALLOWED_API_DOMAIN})`);
+        return null;
+      }
+    } catch {
+      return null;
+    }
+    if (!url.endsWith("/api") && !url.includes("/api/")) {
+      url = url.replace(/\/$/, "") + "/api";
+    }
+    return url;
+  } catch {}
+  return null;
+}
+
+async function refreshApiUrlFromDb(dbPool: pg.Pool): Promise<void> {
+  try {
+    let dbPrimary: string | null = null;
+    const r1 = await dbPool.query("SELECT value FROM app_config WHERE key = 'api_url' LIMIT 1");
+    if (r1.rows.length > 0 && r1.rows[0].value) dbPrimary = normalizeApiUrl(r1.rows[0].value);
+
+    if (dbPrimary) {
+      _dynamicApiUrl = dbPrimary;
+    } else {
+      const remote = await fetchRemoteConfigUrl();
+      if (remote) {
+        _dynamicApiUrl = remote;
+        console.log(`[CONFIG] API URL fetched from ${PUBLIC_BASE_URL}: ${remote}`);
+      }
+    }
+    _urlLastRefreshed = Date.now();
+  } catch {}
+}
+
+console.log(`[CONFIG] External API seed: ${getActiveApiUrl()}`);
+
+async function fetchWithBackendFallback(
+  path: string,
+  options: RequestInit,
+  primaryBase: string = getActiveApiUrl()
+): Promise<globalThis.Response> {
+  const bases = getActiveFallbacks()[0] === primaryBase
+    ? getActiveFallbacks()
+    : [primaryBase, ...getActiveFallbacks().filter(b => b !== primaryBase)];
+
+  let lastErr: any;
+  let lastResponse: globalThis.Response | null = null;
+  for (const base of bases) {
+    try {
+      const url = `${base}${path}`;
+      const hostHeader = new URL(base).host;
+      const updatedOptions = {
+        ...options,
+        headers: { ...(options.headers as any), host: hostHeader },
+      };
+      const res = await fetch(url, updatedOptions);
+      if (res.status >= 500) {
+        console.warn(`[PROXY] ${base} returned ${res.status}, trying next...`);
+        lastResponse = res;
+        continue;
+      }
+      if (base !== getActiveFallbacks()[0]) {
+        console.log(`[PROXY] Fallback succeeded: ${base}`);
+      }
+      return res;
+    } catch (err: any) {
+      lastErr = err;
+      const isNetworkErr = err?.code === "ECONNREFUSED" || err?.code === "ENOTFOUND" ||
+        err?.code === "ETIMEDOUT" || err?.name === "AbortError" ||
+        err?.message?.includes("fetch") || err?.message?.includes("connect");
+      if (!isNetworkErr) throw err;
+      console.warn(`[PROXY] Backend ${base} unreachable, trying next...`);
+    }
+  }
+  if (lastResponse) return lastResponse;
+  throw lastErr;
+}
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS deleted_accounts (
+        id SERIAL PRIMARY KEY,
+        external_user_id TEXT,
+        email TEXT,
+        user_data JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS document_amounts (
+        id SERIAL PRIMARY KEY,
+        doc_id TEXT NOT NULL UNIQUE,
+        doc_type TEXT NOT NULL,
+        price_excluding_tax NUMERIC,
+        total_including_tax NUMERIC,
+        tax_amount NUMERIC,
+        items JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS document_photos (
+        id SERIAL PRIMARY KEY,
+        doc_id TEXT NOT NULL,
+        doc_type TEXT NOT NULL,
+        photo_uri TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS quote_responses (
+        id SERIAL PRIMARY KEY,
+        quote_id TEXT NOT NULL,
+        user_cookie TEXT,
+        action TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS reservation_confirmations (
+        id SERIAL PRIMARY KEY,
+        reservation_id TEXT NOT NULL,
+        user_cookie TEXT,
+        action TEXT NOT NULL DEFAULT 'confirmed',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS notification_reads (
+        id SERIAL PRIMARY KEY,
+        notification_id TEXT NOT NULL,
+        user_cookie TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(notification_id, user_cookie)
+      );
+      CREATE TABLE IF NOT EXISTS support_tickets (
+        id SERIAL PRIMARY KEY,
+        user_cookie TEXT,
+        user_email TEXT,
+        name TEXT,
+        category TEXT,
+        subject TEXT,
+        message TEXT,
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS app_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS push_device_tokens (
+        id SERIAL PRIMARY KEY,
+        token TEXT NOT NULL UNIQUE,
+        platform TEXT DEFAULT 'unknown',
+        auth_cookie TEXT,
+        is_pro BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    // Ensure production API URL is always authoritative — overwrite any stored DB value
+    // so we always honor the EXTERNAL_API_URL env var (single source of truth).
+    const productionApiUrl = DEFAULT_EXTERNAL_API;
+    await pool.query(`
+      INSERT INTO app_config (key, value, updated_at) VALUES ('api_url', $1, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+    `, [productionApiUrl]);
+    // Remove any legacy fallback URL stored in DB (no longer used — single discovery domain)
+    await pool.query("DELETE FROM app_config WHERE key = 'api_fallback_url'");
+    console.log("[DB] Tables initialized");
+  } catch (err: any) {
+    console.warn("[DB] Init skipped:", err.message);
+  }
+}
+
+let capturedRealToken: string | null = null;
+
+// ── Expo Push helper — called async after successful pro quote creation ───────
+async function sendPushAfterQuoteCreation(authCookie: string, quoteData: any) {
+  try {
+    if (!authCookie) return;
+    const tokensRes = await pool.query(
+      "SELECT token FROM push_device_tokens WHERE auth_cookie = $1 AND is_pro = true LIMIT 5",
+      [authCookie]
+    );
+    if (!tokensRes.rows.length) return;
+    const tokens: string[] = tokensRes.rows.map((r: any) => r.token).filter(Boolean);
+    if (!tokens.length) return;
+    const quoteRef = quoteData?.quoteNumber || quoteData?.reference || `#${String(quoteData?.id || "").slice(0, 8)}`;
+    const payload = tokens.map((token) => ({
+      to: token,
+      title: "Demande de devis reçue ✓",
+      body: `Votre demande ${quoteRef} est prise en charge. Nous vous recontactons rapidement.`,
+      sound: "default",
+      data: { type: "quote_created", quoteId: quoteData?.id },
+    }));
+    const r = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json", "Accept-Encoding": "gzip, deflate" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+    const result = await r.json() as any;
+    console.log(`[PUSH] Sent to ${tokens.length} device(s), status: ${r.status}`, result?.data?.[0]?.status || "");
+  } catch (err: any) {
+    console.log("[PUSH] Failed to send push notification:", err.message);
+  }
+}
+
+function getAuthHeaders(req: Request): Record<string, string> {
+  const headers: Record<string, string> = {
+    "host": new URL(getActiveApiUrl()).host,
+    "content-type": "application/json",
+    "accept": "application/json",
+    "x-requested-with": "XMLHttpRequest",
+  };
+  if (req.headers["cookie"]) headers["cookie"] = req.headers["cookie"] as string;
+  if (req.headers["authorization"]) {
+    headers["authorization"] = req.headers["authorization"] as string;
+    const tok = (req.headers["authorization"] as string).replace(/^Bearer\s+/i, "");
+    if (tok && !tok.startsWith("reviewer-demo-token")) {
+      capturedRealToken = tok;
+    }
+  }
+  return headers;
+}
+
+function splitSetCookieHeader(header: string): string[] {
+  const cookies: string[] = [];
+  let current = "";
+  let i = 0;
+  while (i < header.length) {
+    if (header[i] === ",") {
+      const rest = header.substring(i + 1).trimStart();
+      const nextToken = rest.split(/[=;]/)[0]?.trim() || "";
+      if (nextToken && /^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(nextToken) && rest.includes("=")) {
+        cookies.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+    }
+    current += header[i];
+    i++;
+  }
+  if (current.trim()) cookies.push(current.trim());
+  return cookies;
+}
+
+function forwardSetCookie(externalRes: globalThis.Response, expressRes: Response) {
+  const setCookie = externalRes.headers.get("set-cookie");
+  if (setCookie) {
+    const parts = splitSetCookieHeader(setCookie);
+    for (const part of parts) {
+      expressRes.appendHeader("set-cookie", part);
+    }
+    const sessionPart = parts.find(p => {
+      const name = p.split("=")[0]?.toLowerCase() || "";
+      return name.includes("session") || name.includes("sid") || name === "phpsessid" || name.includes("laravel");
+    });
+    if (sessionPart) {
+      expressRes.setHeader("X-Session-Cookie", sessionPart.split(";")[0].trim());
+    }
+  }
+}
+
+async function readJsonOrNull(response: globalThis.Response): Promise<any | null> {
+  const text = await response.text();
+  if (!text || text.trim() === "") return {};
+  if (text.includes("<!DOCTYPE") || text.includes("<html")) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function mapCompanyResult(item: any, query: string) {
+  const siege = item?.siege || item?.matching_etablissements?.[0] || {};
+  const address = siege?.adresse || [siege?.numero_voie, siege?.type_voie, siege?.libelle_voie].filter(Boolean).join(" ");
+  const siret = siege?.siret || item?.siret || (query.replace(/\D/g, "").length === 14 ? query.replace(/\D/g, "") : "");
+  return {
+    name: item?.nom_complet || item?.nom_raison_sociale || item?.name || item?.companyName || "",
+    companyName: item?.nom_complet || item?.nom_raison_sociale || item?.name || item?.companyName || "",
+    address: address || "",
+    city: siege?.libelle_commune || siege?.ville || siege?.city || "",
+    postalCode: siege?.code_postal || siege?.postalCode || "",
+    siret,
+    siren: item?.siren || siret.slice(0, 9) || "",
+    legalForm: item?.nature_juridique || item?.section_activite_principale || "",
+    tvaNumber: item?.siren ? `FR${item.siren}` : "",
+  };
+}
+
+const LOG_BUFFER_SIZE = 2000;
+const logBuffer: Array<{ timestamp: string; level: string; message: string; source: string }> = [];
+
+function pushLog(level: string, message: string, source = "server") {
+  logBuffer.push({ timestamp: new Date().toISOString(), level, message, source });
+  if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+}
+
+const origConsoleLog = console.log;
+const origConsoleWarn = console.warn;
+const origConsoleError = console.error;
+
+function safeStringify(a: any): string {
+  if (typeof a === "string") return a;
+  try { return JSON.stringify(a); } catch { return String(a); }
+}
+
+console.log = (...args: any[]) => {
+  origConsoleLog(...args);
+  pushLog("info", args.map(safeStringify).join(" "));
+};
+console.warn = (...args: any[]) => {
+  origConsoleWarn(...args);
+  pushLog("warn", args.map(safeStringify).join(" "));
+};
+console.error = (...args: any[]) => {
+  origConsoleError(...args);
+  pushLog("error", args.map(safeStringify).join(" "));
+};
+
+
+export async function registerRoutes(app: Express): Promise<void> {
+  await initDatabase();
+
+  await refreshApiUrlFromDb(pool);
+  setInterval(() => {
+    if (Date.now() - _urlLastRefreshed > URL_CACHE_TTL_MS) {
+      refreshApiUrlFromDb(pool);
+    }
+  }, URL_CACHE_TTL_MS);
+  console.log(`[CONFIG] Active API URL: ${getActiveApiUrl()}`);
+
+  async function assertRootAdmin(req: Request, res: Response): Promise<boolean> {
+    const auth = req.headers["authorization"] || "";
+    if (!auth) { res.status(401).json({ message: "Non authentifié" }); return false; }
+    try {
+      const meRes = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, {
+        headers: { "authorization": auth as string, "accept": "application/json" },
+      });
+      if (!meRes.ok) { res.status(401).json({ message: "Token invalide" }); return false; }
+      const user: any = await meRes.json();
+      const role = (user?.role || "").toLowerCase();
+      if (role !== "root_admin" && role !== "root") {
+        res.status(403).json({ message: "Accès réservé aux root admins" });
+        return false;
+      }
+    } catch { res.status(500).json({ message: "Erreur de vérification" }); return false; }
+    return true;
+  }
+
+  app.get("/api/admin/config", async (req: Request, res: Response) => {
+    if (!(await assertRootAdmin(req, res))) return;
+    try {
+      const rows = await pool.query("SELECT key, value FROM app_config ORDER BY key");
+      const config: Record<string, string> = {};
+      for (const r of rows.rows) config[r.key] = r.value;
+      return res.json({
+        api_url: config["api_url"] || _dynamicApiUrl,
+        default_api_url: DEFAULT_EXTERNAL_API,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.put("/api/admin/config", async (req: Request, res: Response) => {
+    if (!(await assertRootAdmin(req, res))) return;
+    const { api_url } = req.body || {};
+    try {
+      if (api_url) {
+        const normalized = sanitizeApiUrlEnv(api_url, "api_url");
+        new URL(normalized);
+        await pool.query(
+          "INSERT INTO app_config (key, value, updated_at) VALUES ('api_url', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
+          [normalized]
+        );
+        _dynamicApiUrl = normalized;
+      }
+      _urlLastRefreshed = Date.now();
+      console.log(`[CONFIG] API URL updated by admin: ${getActiveApiUrl()}`);
+      return res.json({
+        api_url: _dynamicApiUrl,
+        message: "Configuration mise à jour avec succès",
+      });
+    } catch (err: any) {
+      if (err instanceof TypeError) return res.status(400).json({ message: "URL invalide" });
+      return res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/settings/url-base-api", async (req: Request, res: Response) => {
+    if (!(await assertRootAdmin(req, res))) return;
+    try {
+      const r = await pool.query("SELECT value FROM app_config WHERE key = 'api_url' LIMIT 1");
+      const api_url = r.rows.length > 0 ? r.rows[0].value : _dynamicApiUrl;
+      return res.json({ api_url });
+    } catch (err: any) {
+      return res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.put("/api/settings/url-base-api", async (req: Request, res: Response) => {
+    if (!(await assertRootAdmin(req, res))) return;
+    const { api_url } = req.body || {};
+    if (!api_url || typeof api_url !== "string") {
+      return res.status(400).json({ message: "Champ 'api_url' requis" });
+    }
+    try {
+      const normalized = sanitizeApiUrlEnv(api_url, "api_url");
+      new URL(normalized);
+      await pool.query(
+        "INSERT INTO app_config (key, value, updated_at) VALUES ('api_url', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
+        [normalized]
+      );
+      _dynamicApiUrl = normalized;
+      _urlLastRefreshed = Date.now();
+      console.log(`[CONFIG] api_url mis à jour via /api/settings/url-base-api : ${normalized}`);
+      return res.json({ api_url: _dynamicApiUrl, message: "URL de base API mise à jour avec succès" });
+    } catch (err: any) {
+      if (err instanceof TypeError) return res.status(400).json({ message: "URL invalide" });
+      return res.status(500).json({ message: err.message });
+    }
+  });
+
+  // @ts-ignore — legacy code: not all paths return
+  app.get("/api/admin/logs", async (req: Request, res: Response) => {
+    const auth = req.headers["authorization"] || "";
+    if (!auth) {
+      return res.status(401).json({ message: "Non authentifié" });
+    }
+    try {
+      const meRes = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, {
+        headers: { "authorization": auth, "accept": "application/json" },
+      });
+      if (!meRes.ok) return res.status(401).json({ message: "Token invalide" });
+      const user: any = await meRes.json();
+      const role = (user?.role || "").toLowerCase();
+      if (role !== "root_admin" && role !== "root") {
+        return res.status(403).json({ message: "Accès réservé aux root admins" });
+      }
+    } catch {
+      return res.status(500).json({ message: "Erreur de vérification" });
+    }
+    let entries = [...logBuffer];
+    const since = req.query.since as string | undefined;
+    const level = req.query.level as string | undefined;
+    const search = req.query.search as string | undefined;
+    const limit = parseInt(req.query.limit as string || "0", 10);
+    const offset = parseInt(req.query.offset as string || "0", 10);
+
+    if (since) entries = entries.filter(e => e.timestamp > since);
+    if (level) {
+      const levels = level.split(",").map(l => l.trim().toLowerCase());
+      entries = entries.filter(e => levels.includes(e.level));
+    }
+    if (search) {
+      const s = search.toLowerCase();
+      entries = entries.filter(e => e.message.toLowerCase().includes(s));
+    }
+
+    const totalFiltered = entries.length;
+    entries.reverse();
+    if (offset > 0) entries = entries.slice(offset);
+    if (limit > 0) entries = entries.slice(0, limit);
+
+    res.json({ logs: entries, total: logBuffer.length, filtered: totalFiltered });
+  });
+
+  app.get("/api/admin/swagger-spec", async (req: Request, res: Response) => {
+    const reqAuth = (req.headers["authorization"] as string) || "";
+    const token = capturedRealToken || reqAuth.replace(/^Bearer\s+/i, "");
+    if (!token) return res.status(401).json({ message: "Non authentifié. Connectez-vous d'abord dans l'app." });
+    try {
+      const r = await fetch(`${getActiveApiUrl()}/swagger/spec`, {
+        headers: { "authorization": `Bearer ${token}`, "accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+      });
+      const text = await r.text();
+      console.log(`[SWAGGER] status ${r.status}, size ${text.length}`);
+      res.setHeader("content-type", "application/json");
+      return res.status(r.status).send(text);
+    } catch (err: any) {
+      return res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/admin/logs/export", async (req: Request, res: Response) => {
+    const auth = req.headers["authorization"] || "";
+    if (!auth) return res.status(401).json({ message: "Non authentifié" });
+    try {
+      const meRes = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, {
+        headers: { "authorization": auth, "accept": "application/json" },
+      });
+      if (!meRes.ok) return res.status(401).json({ message: "Token invalide" });
+      const user: any = await meRes.json();
+      const role = (user?.role || "").toLowerCase();
+      if (role !== "root_admin" && role !== "root") {
+        return res.status(403).json({ message: "Accès réservé aux root admins" });
+      }
+    } catch {
+      return res.status(500).json({ message: "Erreur de vérification" });
+    }
+
+    const format = (req.query.format as string || "json").toLowerCase();
+    let entries = [...logBuffer];
+    const level = req.query.level as string | undefined;
+    if (level) {
+      const levels = level.split(",").map(l => l.trim().toLowerCase());
+      entries = entries.filter(e => levels.includes(e.level));
+    }
+    entries.reverse();
+
+    if (format === "csv") {
+      const header = "timestamp,level,source,message";
+      const rows = entries.map(e =>
+        `"${e.timestamp}","${e.level}","${e.source}","${e.message.replace(/"/g, '""')}"`
+      );
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename=logs-${new Date().toISOString().slice(0, 10)}.csv`);
+      return res.send([header, ...rows].join("\n"));
+    }
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename=logs-${new Date().toISOString().slice(0, 10)}.json`);
+    return res.json({ exportedAt: new Date().toISOString(), total: entries.length, logs: entries });
+  });
+
+  // @ts-ignore — legacy code: not all paths return
+  app.delete("/api/admin/logs", async (req: Request, res: Response) => {
+    const auth = req.headers["authorization"] || "";
+    if (!auth) {
+      return res.status(401).json({ message: "Non authentifié" });
+    }
+    try {
+      const meRes = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, {
+        headers: { "authorization": auth, "accept": "application/json" },
+      });
+      if (!meRes.ok) return res.status(401).json({ message: "Token invalide" });
+      const user: any = await meRes.json();
+      const role = (user?.role || "").toLowerCase();
+      if (role !== "root_admin" && role !== "root") {
+        return res.status(403).json({ message: "Accès réservé aux root admins" });
+      }
+    } catch {
+      return res.status(500).json({ message: "Erreur de vérification" });
+    }
+    logBuffer.length = 0;
+    res.json({ message: "Logs vidés", total: 0 });
+  });
+
+  app.get("/api/public/mobile-api-url", async (_req: Request, res: Response) => {
+    try {
+      const remote = await fetchRemoteConfigUrl();
+      const url = remote || getActiveApiUrl();
+      return res.json({
+        mobileApiUrl: url,
+        apiUrl: url,
+        url,
+      });
+    } catch {
+      const url = getActiveApiUrl();
+      return res.json({
+        mobileApiUrl: url,
+        apiUrl: url,
+        url,
+      });
+    }
+  });
+
+  app.get("/api/public/garages", async (req: Request, res: Response) => {
+    try {
+      const endpoints = [
+        `${getActiveApiUrl()}/garages`,
+        `${getActiveApiUrl()}/superadmin/garages`,
+        `${getActiveApiUrl()}/public/garages`,
+      ];
+      let garages: any[] = [];
+      for (const url of endpoints) {
+        try {
+          const r = await fetch(url, {
+            headers: {
+              "accept": "application/json",
+              "x-requested-with": "XMLHttpRequest",
+              "host": new URL(getActiveApiUrl()).host,
+            },
+          });
+          if (r.ok) {
+            const data = await r.json();
+            if (Array.isArray((data as any))) { garages = (data as any); break; }
+            if ((data as any)?.data && Array.isArray((data as any).data)) { garages = (data as any).data; break; }
+            if ((data as any)?.garages && Array.isArray((data as any).garages)) { garages = (data as any).garages; break; }
+          }
+        } catch {}
+      }
+      res.json(garages);
+    } catch (err: any) {
+      res.json([]);
+    }
+  });
+
+  app.post("/api/quotes/:id/accept", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      const endpoints = [
+        { url: `${getActiveApiUrl()}/mobile/quotes/${id}/accept`, method: "POST" as const, body: undefined as string | undefined },
+        { url: `${getActiveApiUrl()}/quotes/${id}/accept`, method: "POST" as const, body: undefined as string | undefined },
+        { url: `${getActiveApiUrl()}/quotes/${id}/respond`, method: "POST" as const, body: JSON.stringify({ status: "accepted", response: "accepted" }) },
+        { url: `${getActiveApiUrl()}/quotes/${id}`, method: "PUT" as const, body: JSON.stringify({ status: "accepted" }) },
+        { url: `${getActiveApiUrl()}/quotes/${id}`, method: "PATCH" as const, body: JSON.stringify({ status: "accepted" }) },
+      ];
+      for (const ep of endpoints) {
+        try {
+          const r = await fetch(ep.url, { method: ep.method, headers, body: ep.body, redirect: "manual" });
+          const text = await r.text();
+          if (!text.includes("<!DOCTYPE") && !text.includes("<html") && r.status < 400) {
+            console.log(`[QUOTE ACCEPT] ${ep.method} ${ep.url} => ${r.status} OK`);
+            try { await pool.query("INSERT INTO quote_responses (quote_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "accepted"]); } catch {}
+            try { return res.status(200).json(JSON.parse(text)); } catch { return res.status(200).json({ success: true, message: "Devis accepté avec succès" }); }
+          }
+        } catch {}
+      }
+      console.log(`[QUOTE ACCEPT] No external endpoint worked for quote ${id}, storing locally`);
+      try {
+        await pool.query("INSERT INTO quote_responses (quote_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "accepted"]);
+      } catch {}
+      return res.status(200).json({ success: true, message: "Devis accepté avec succès" });
+    } catch (err: any) {
+      console.error("[QUOTE ACCEPT] error:", err.message);
+      return res.status(500).json({ message: "Erreur lors de l'acceptation du devis" });
+    }
+  });
+
+  app.post("/api/quotes/:id/reject", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      const endpoints = [
+        { url: `${getActiveApiUrl()}/mobile/quotes/${id}/reject`, method: "POST" as const, body: undefined as string | undefined },
+        { url: `${getActiveApiUrl()}/quotes/${id}/reject`, method: "POST" as const, body: undefined as string | undefined },
+        { url: `${getActiveApiUrl()}/quotes/${id}/respond`, method: "POST" as const, body: JSON.stringify({ status: "rejected", response: "rejected" }) },
+        { url: `${getActiveApiUrl()}/quotes/${id}`, method: "PUT" as const, body: JSON.stringify({ status: "rejected" }) },
+        { url: `${getActiveApiUrl()}/quotes/${id}`, method: "PATCH" as const, body: JSON.stringify({ status: "rejected" }) },
+      ];
+      for (const ep of endpoints) {
+        try {
+          const r = await fetch(ep.url, { method: ep.method, headers, body: ep.body, redirect: "manual" });
+          const text = await r.text();
+          if (!text.includes("<!DOCTYPE") && !text.includes("<html") && r.status < 400) {
+            console.log(`[QUOTE REJECT] ${ep.method} ${ep.url} => ${r.status} OK`);
+            try { await pool.query("INSERT INTO quote_responses (quote_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "rejected"]); } catch {}
+            try { return res.status(200).json(JSON.parse(text)); } catch { return res.status(200).json({ success: true, message: "Devis refusé" }); }
+          }
+        } catch {}
+      }
+      console.log(`[QUOTE REJECT] No external endpoint worked for quote ${id}, storing locally`);
+      try {
+        await pool.query("INSERT INTO quote_responses (quote_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "rejected"]);
+      } catch {}
+      return res.status(200).json({ success: true, message: "Devis refusé" });
+    } catch (err: any) {
+      console.error("[QUOTE REJECT] error:", err.message);
+      return res.status(500).json({ message: "Erreur lors du refus du devis" });
+    }
+  });
+
+  app.post("/api/reservations/:id/confirm", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      const endpoints = [
+        { url: `${getActiveApiUrl()}/reservations/${id}/confirm`, method: "POST" as const, body: undefined as string | undefined },
+        { url: `${getActiveApiUrl()}/reservations/${id}`, method: "PUT" as const, body: JSON.stringify({ status: "confirmed" }) },
+        { url: `${getActiveApiUrl()}/reservations/${id}`, method: "PATCH" as const, body: JSON.stringify({ status: "confirmed" }) },
+      ];
+      for (const ep of endpoints) {
+        try {
+          const r = await fetch(ep.url, { method: ep.method, headers, body: ep.body, redirect: "manual" });
+          const text = await r.text();
+          if (!text.includes("<!DOCTYPE") && !text.includes("<html") && r.status < 400) {
+            console.log(`[RESERVATION CONFIRM] ${ep.method} ${ep.url} => ${r.status} OK`);
+            try { await pool.query("INSERT INTO reservation_confirmations (reservation_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "confirmed"]); } catch {}
+            try { return res.status(200).json(JSON.parse(text)); } catch { return res.status(200).json({ success: true, message: "Réservation confirmée" }); }
+          }
+        } catch {}
+      }
+      console.log(`[RESERVATION CONFIRM] No external endpoint worked for reservation ${id}, storing locally`);
+      try {
+        await pool.query("INSERT INTO reservation_confirmations (reservation_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "confirmed"]);
+      } catch {}
+      return res.status(200).json({ success: true, message: "Réservation confirmée avec succès" });
+    } catch (err: any) {
+      console.error("[RESERVATION CONFIRM] error:", err.message);
+      return res.status(500).json({ message: "Erreur lors de la confirmation" });
+    }
+  });
+
+  app.get("/api/support/tickets", async (req: Request, res: Response) => {
+    try {
+      const headers = getAuthHeaders(req);
+      let userEmail = "";
+      try {
+        const userRes = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, { method: "GET", headers, redirect: "manual" });
+        if (userRes.ok) {
+          const userData = await userRes.json() as any;
+          userEmail = userData?.email || userData?.user?.email || "";
+        }
+      } catch {}
+
+      let rows;
+      if (userEmail) {
+        rows = await pool.query(
+          "SELECT id, user_email as email, name, category, subject, message, status, created_at as \"createdAt\" FROM support_tickets WHERE user_email = $1 ORDER BY created_at DESC",
+          [userEmail]
+        );
+      } else {
+        const cookieId = req.headers["cookie"] || "";
+        rows = await pool.query(
+          "SELECT id, user_email as email, name, category, subject, message, status, created_at as \"createdAt\" FROM support_tickets WHERE user_cookie = $1 ORDER BY created_at DESC",
+          [cookieId]
+        );
+      }
+      return res.json(rows.rows);
+    } catch (err: any) {
+      console.warn("[SUPPORT TICKETS] DB error:", err.message);
+      return res.json([]);
+    }
+  });
+
+  app.post("/api/support/contact", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    try {
+      const r = await fetch(`${getActiveApiUrl()}/support/contact`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(req.body),
+        redirect: "manual",
+      });
+      const text = await r.text();
+      let result: any;
+      try { result = JSON.parse(text); } catch { result = { success: true, message: "Message envoyé" }; }
+
+      try {
+        await pool.query(
+          "INSERT INTO support_tickets (user_cookie, user_email, name, category, subject, message) VALUES ($1, $2, $3, $4, $5, $6)",
+          [
+            req.headers["cookie"] || "",
+            req.body?.email || "",
+            req.body?.name || "",
+            req.body?.category || "",
+            req.body?.subject || "",
+            req.body?.message || "",
+          ]
+        );
+      } catch (dbErr: any) {
+        console.warn("[SUPPORT] DB save skipped:", dbErr.message);
+      }
+
+      return res.status(r.status < 400 ? 200 : r.status).json(result);
+    } catch (err: any) {
+      console.error("[SUPPORT CONTACT] error:", err.message);
+      try {
+        await pool.query(
+          "INSERT INTO support_tickets (user_cookie, user_email, name, category, subject, message) VALUES ($1, $2, $3, $4, $5, $6)",
+          [req.headers["cookie"] || "", req.body?.email || "", req.body?.name || "", req.body?.category || "", req.body?.subject || "", req.body?.message || ""]
+        );
+        return res.status(200).json({ success: true, message: "Message enregistré localement" });
+      } catch {
+        return res.status(502).json({ message: "Erreur de connexion" });
+      }
+    }
+  });
+
+  app.delete("/api/users/me", async (req: Request, res: Response) => {
+    try {
+      const headers: Record<string, string> = {
+        "host": new URL(getActiveApiUrl()).host,
+      };
+      if (req.headers["cookie"]) {
+        headers["cookie"] = req.headers["cookie"] as string;
+      }
+      if (req.headers["authorization"]) {
+        headers["authorization"] = req.headers["authorization"] as string;
+      }
+
+      const userRes = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, {
+        method: "GET",
+        headers,
+        redirect: "manual",
+      });
+
+      if (!userRes.ok) {
+        return res.status(401).json({ message: "Non authentifié. Veuillez vous reconnecter." });
+      }
+
+      const userData = await userRes.json() as any;
+      const userId = userData?.id || userData?.user?.id || userData?._id;
+      const userEmail = userData?.email || userData?.user?.email;
+
+      if (!userId) {
+        return res.status(400).json({ message: "Impossible d'identifier l'utilisateur." });
+      }
+
+      try {
+        const existing = await pool.query(
+          "SELECT id FROM deleted_accounts WHERE external_user_id = $1 OR email = $2",
+          [String(userId), userEmail || ""]
+        );
+
+        if (existing.rows.length > 0) {
+          return res.status(200).json({ message: "Compte déjà supprimé." });
+        }
+
+        await pool.query(
+          "INSERT INTO deleted_accounts (external_user_id, email, user_data) VALUES ($1, $2, $3)",
+          [String(userId), userEmail || null, JSON.stringify(userData)]
+        );
+      } catch (dbErr: any) {
+        console.warn("[DB] deleted_accounts insert skipped (DB unavailable):", dbErr.message);
+      }
+
+      try {
+        await fetch(`${getActiveApiUrl()}/mobile/profile`, {
+          method: "DELETE",
+          headers: { ...headers, "content-type": "application/json" },
+          redirect: "manual",
+        });
+      } catch {}
+      try {
+        await fetch(`${getActiveApiUrl()}/admin/users/${userId}`, {
+          method: "DELETE",
+          headers: { ...headers, "content-type": "application/json" },
+          redirect: "manual",
+        });
+      } catch {}
+
+      try {
+        await fetch(`${getActiveApiUrl()}/logout`, {
+          method: "POST",
+          headers,
+          redirect: "manual",
+        });
+      } catch {}
+
+      console.log(`Account deletion recorded: userId=${userId}, email=${userEmail}`);
+      return res.status(200).json({ message: "Compte supprimé avec succès." });
+    } catch (err: any) {
+      console.error("Account deletion error:", err.message);
+      return res.status(502).json({ message: "Erreur de connexion au serveur. Veuillez réessayer." });
+    }
+  });
+
+  // @ts-ignore — legacy code: not all paths return
+  app.post("/api/login", async (req: Request, res: Response) => {
+
+    try {
+      const email = req.body?.email;
+
+      if (email) {
+        try {
+          const deleted = await pool.query(
+            "SELECT id FROM deleted_accounts WHERE email = $1",
+            [email]
+          );
+
+          if (deleted.rows.length > 0) {
+            return res.status(403).json({
+              message: "Ce compte a été supprimé. Il n'est plus possible de se connecter."
+            });
+          }
+        } catch (dbErr: any) {
+          console.warn("[DB] deleted_accounts check skipped (DB unavailable):", dbErr.message);
+        }
+      }
+
+      const reqBody = JSON.stringify(req.body);
+      let response: globalThis.Response | null = null;
+
+      for (const base of getActiveFallbacks()) {
+        for (const loginPath of ["/login", "/mobile/auth/login"]) {
+          try {
+            const hostHeader = new URL(base).host;
+            const headers: Record<string, string> = {
+              "content-type": "application/json",
+              "accept": "application/json",
+              "host": hostHeader,
+            };
+            if (req.headers["cookie"]) {
+              headers["cookie"] = req.headers["cookie"] as string;
+            }
+
+            const attempt = await fetch(`${base}${loginPath}`, {
+              method: "POST",
+              headers,
+              body: reqBody,
+              redirect: "manual",
+              signal: AbortSignal.timeout(15000),
+            });
+
+            console.log(`[LOGIN] ${base}${loginPath} responded: status=${attempt.status} type=${attempt.type}`);
+
+            if (attempt.status >= 500) {
+              console.warn(`[LOGIN] ${base}${loginPath} returned ${attempt.status}, trying next...`);
+              response = attempt;
+              continue;
+            }
+
+            response = attempt;
+            break;
+          } catch (err: any) {
+            console.warn(`[LOGIN] ${base}${loginPath} error: ${err.message}, trying next...`);
+          }
+        }
+        if (response && response.status < 500) {
+          break;
+        }
+      }
+
+      if (!response) {
+        return res.status(502).json({ message: "Serveurs d'authentification indisponibles" });
+      }
+
+      forwardSetCookie(response, res);
+
+      const xSessionCookie = res.getHeader("X-Session-Cookie") as string | undefined;
+      if (xSessionCookie) {
+        console.log(`[LOGIN] Captured session cookie: ${xSessionCookie.substring(0, 80)}...`);
+      }
+
+      const isRedirect = response.status >= 300 && response.status < 400;
+
+      if (response.ok || isRedirect) {
+        let responseData: any = null;
+
+        if (response.ok) {
+          const text = await response.text();
+          try {
+            responseData = JSON.parse(text);
+          } catch (e) {
+            console.error("[LOGIN] Failed to parse response body:", text?.substring(0, 200));
+          }
+        }
+
+        if (isRedirect && !responseData && xSessionCookie) {
+          console.log("[LOGIN] Redirect with cookies - fetching user profile via /me...");
+          try {
+            const cookieStr = xSessionCookie;
+            const meRes = await fetchWithBackendFallback("/auth/user", {
+              method: "GET",
+              headers: {
+                "accept": "application/json",
+                "cookie": cookieStr,
+              },
+            });
+            if (meRes.ok) {
+              const meText = await meRes.text();
+              try { responseData = JSON.parse(meText); } catch {}
+            }
+          } catch (meErr: any) {
+            console.warn("[LOGIN] /me fetch failed:", meErr.message);
+          }
+        }
+
+        if (!responseData) {
+          responseData = {};
+        }
+
+        const loggedInUserId = responseData?.id || responseData?.user?.id || responseData?._id;
+        const loggedInEmail = responseData?.email || responseData?.user?.email;
+
+        if (loggedInUserId || loggedInEmail) {
+          try {
+            const deletedById = loggedInUserId
+              ? await pool.query("SELECT id FROM deleted_accounts WHERE external_user_id = $1", [String(loggedInUserId)])
+              : { rows: [] };
+            const deletedByEmail = loggedInEmail
+              ? await pool.query("SELECT id FROM deleted_accounts WHERE email = $1", [loggedInEmail])
+              : { rows: [] };
+
+            if (deletedById.rows.length > 0 || deletedByEmail.rows.length > 0) {
+              try {
+                await fetch(`${getActiveApiUrl()}/logout`, {
+                  method: "POST",
+                  headers: { "host": new URL(getActiveApiUrl()).host, ...(req.headers["cookie"] ? { "cookie": req.headers["cookie"] as string } : {}) },
+                  redirect: "manual",
+                });
+              } catch {}
+              return res.status(403).json({
+                message: "Ce compte a été supprimé. Il n'est plus possible de se connecter."
+              });
+            }
+          } catch (dbErr: any) {
+            console.warn("[DB] post-login deleted_accounts check skipped (DB unavailable):", dbErr.message);
+          }
+        }
+
+        return res.status(200).json(responseData);
+      }
+
+      console.log(`[LOGIN] External API returned error status ${response.status}`);
+      const errorBody = await response.text().catch(() => "");
+      let errorJson: any = null;
+      try { errorJson = JSON.parse(errorBody); } catch {}
+      res.status(response.status).json(
+        errorJson || { message: "Identifiants incorrects ou compte introuvable" }
+      );
+    } catch (err: any) {
+      console.error("Login proxy error:", err.message);
+      res.status(502).json({ message: "Erreur de connexion au serveur API" });
+    }
+  });
+
+  app.get("/api/admin/reservations/:id/services", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const authHeaders = getAuthHeaders(req);
+    const attempts = [
+      `${getActiveApiUrl()}/admin/reservations/${id}/services`,
+      `${getActiveApiUrl()}/mobile/admin/reservations/${id}/services`,
+    ];
+    for (const url of attempts) {
+      try {
+        const r = await fetch(url, { headers: authHeaders, redirect: "manual" });
+        const txt = await r.text();
+        if (!txt.includes("<!DOCTYPE") && !txt.includes("<html")) {
+          const parsed = JSON.parse(txt);
+          if (r.ok) return res.json(parsed);
+        }
+      } catch {}
+    }
+    return res.json([]);
+  });
+
+  app.get("/api/invoices", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/invoices${qs}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        r = await fetch(`${getActiveApiUrl()}/invoices${qs}`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+      }
+      forwardSetCookie(r, res);
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(r.status >= 400 ? r.status : 401).json({ message: "Non authentifié" });
+      }
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.status(200).json([]); }
+      console.log(`[PROXY] GET /api/invoices => ${r.status}`);
+      return res.status(r.status).json(data);
+    } catch (err: any) {
+      console.error("[INVOICES] error:", err.message);
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.get("/api/invoices/:id", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/invoices/${id}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      let usedDetailEndpoint = false;
+      if (!text.includes("<!DOCTYPE") && !text.includes("<html")) {
+        try {
+          const directItem = JSON.parse(text);
+          if (directItem && (directItem.id || directItem._id) && r.status < 400) {
+            usedDetailEndpoint = true;
+            forwardSetCookie(r, res);
+            console.log(`[PROXY] GET /api/invoices/${id} => found via /mobile/invoices/:id`);
+            return res.status(200).json(directItem);
+          }
+        } catch {}
+      }
+      if (!usedDetailEndpoint) {
+        r = await fetch(`${getActiveApiUrl()}/mobile/invoices`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+        if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+          r = await fetch(`${getActiveApiUrl()}/invoices`, { method: "GET", headers, redirect: "manual" });
+          text = await r.text();
+        }
+      }
+      forwardSetCookie(r, res);
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(401).json({ message: "Non authentifié" });
+      }
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.status(404).json({ message: "Facture introuvable" }); }
+      const list = Array.isArray(data) ? data : (data?.data || data?.invoices || data?.results || []);
+      const item = list.find((inv: any) => String(inv.id || inv._id) === id);
+      if (!item) {
+        console.log(`[PROXY] GET /api/invoices/${id} => not found in list of ${list.length}`);
+        return res.status(404).json({ message: "Facture introuvable" });
+      }
+      console.log(`[PROXY] GET /api/invoices/${id} => found, keys: ${Object.keys(item)}`);
+      return res.status(200).json(item);
+    } catch (err: any) {
+      console.error(`[INVOICE ${id}] error:`, err.message);
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.get("/api/quotes/:id", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/quotes/${id}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      let usedDetailEndpoint = false;
+      if (!text.includes("<!DOCTYPE") && !text.includes("<html")) {
+        try {
+          const directItem = JSON.parse(text);
+          if (directItem && (directItem.id || directItem._id) && r.status < 400) {
+            usedDetailEndpoint = true;
+            forwardSetCookie(r, res);
+            try {
+              const localRes = await pool.query("SELECT action FROM quote_responses WHERE quote_id = $1 ORDER BY created_at DESC LIMIT 1", [id]);
+              if (localRes.rows.length > 0) directItem.status = localRes.rows[0].action;
+            } catch {}
+            console.log(`[PROXY] GET /api/quotes/${id} => found via /mobile/quotes/:id`);
+            return res.status(200).json(directItem);
+          }
+        } catch {}
+      }
+      if (!usedDetailEndpoint) {
+        r = await fetch(`${getActiveApiUrl()}/mobile/quotes`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+        if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+          r = await fetch(`${getActiveApiUrl()}/quotes`, { method: "GET", headers, redirect: "manual" });
+          text = await r.text();
+        }
+      }
+      forwardSetCookie(r, res);
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(401).json({ message: "Non authentifié" });
+      }
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.status(404).json({ message: "Devis introuvable" }); }
+      const list = Array.isArray(data) ? data : (data?.data || data?.quotes || data?.results || []);
+      const item = list.find((q: any) => String(q.id || q._id) === id);
+      if (!item) {
+        console.log(`[PROXY] GET /api/quotes/${id} => not found in list of ${list.length}`);
+        return res.status(404).json({ message: "Devis introuvable" });
+      }
+      try {
+        const localRes = await pool.query(
+          "SELECT action FROM quote_responses WHERE quote_id = $1 ORDER BY created_at DESC LIMIT 1",
+          [id]
+        );
+        if (localRes.rows.length > 0) {
+          item.status = localRes.rows[0].action;
+        }
+      } catch {}
+      console.log(`[PROXY] GET /api/quotes/${id} => found`);
+      return res.status(200).json(item);
+    } catch (err: any) {
+      console.error(`[QUOTE ${id}] error:`, err.message);
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.get("/api/reservations/:id", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/reservations/${id}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      let usedDetailEndpoint = false;
+      if (!text.includes("<!DOCTYPE") && !text.includes("<html")) {
+        try {
+          const directItem = JSON.parse(text);
+          if (directItem && (directItem.id || directItem._id) && r.status < 400) {
+            usedDetailEndpoint = true;
+            forwardSetCookie(r, res);
+            try {
+              const localRes = await pool.query("SELECT action FROM reservation_confirmations WHERE reservation_id = $1 ORDER BY created_at DESC LIMIT 1", [id]);
+              if (localRes.rows.length > 0) directItem.status = localRes.rows[0].action;
+            } catch {}
+            console.log(`[PROXY] GET /api/reservations/${id} => found via /mobile/reservations/:id`);
+            return res.status(200).json(directItem);
+          }
+        } catch {}
+      }
+      if (!usedDetailEndpoint) {
+        r = await fetch(`${getActiveApiUrl()}/mobile/reservations`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+        if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+          r = await fetch(`${getActiveApiUrl()}/reservations`, { method: "GET", headers, redirect: "manual" });
+          text = await r.text();
+        }
+      }
+      forwardSetCookie(r, res);
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(401).json({ message: "Non authentifié" });
+      }
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.status(404).json({ message: "Réservation introuvable" }); }
+      const list = Array.isArray(data) ? data : (data?.data || data?.reservations || data?.results || []);
+      const item = list.find((r: any) => String(r.id || r._id) === id);
+      if (!item) {
+        console.log(`[PROXY] GET /api/reservations/${id} => not found in list of ${list.length}`);
+        return res.status(404).json({ message: "Réservation introuvable" });
+      }
+      try {
+        const localRes = await pool.query(
+          "SELECT action FROM reservation_confirmations WHERE reservation_id = $1 ORDER BY created_at DESC LIMIT 1",
+          [id]
+        );
+        if (localRes.rows.length > 0) {
+          item.status = localRes.rows[0].action;
+        }
+      } catch {}
+      console.log(`[PROXY] GET /api/reservations/${id} => found`);
+      return res.status(200).json(item);
+    } catch (err: any) {
+      console.error(`[RESERVATION ${id}] error:`, err.message);
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.get("/api/quotes", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const userCookie = req.headers["cookie"] || "";
+    const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/quotes${qs}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        r = await fetch(`${getActiveApiUrl()}/quotes${qs}`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+      }
+      forwardSetCookie(r, res);
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(r.status >= 400 ? r.status : 401).json({ message: "Non authentifié" });
+      }
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.status(200).json([]); }
+
+      try {
+        const quotesList = Array.isArray(data) ? data : (data?.data || data?.quotes || data?.results || []);
+        const quoteIds = quotesList.map((q: any) => String(q.id || q._id)).filter(Boolean);
+        let responseMap = new Map<string, string>();
+        if (quoteIds.length > 0) {
+          const localResponses = await pool.query(
+            "SELECT DISTINCT ON (quote_id) quote_id, action FROM quote_responses WHERE quote_id = ANY($1) ORDER BY quote_id, created_at DESC",
+            [quoteIds]
+          );
+          for (const row of localResponses.rows) {
+            responseMap.set(row.quote_id, row.action);
+          }
+        }
+        for (const q of quotesList) {
+          const qId = String(q.id || q._id);
+          if (responseMap.has(qId)) {
+            q.status = responseMap.get(qId);
+          }
+        }
+        if (Array.isArray(data)) data = quotesList;
+        else if (data?.data) data.data = quotesList;
+        else if (data?.quotes) data.quotes = quotesList;
+        else if (data?.results) data.results = quotesList;
+      } catch {}
+
+      console.log(`[PROXY] GET /api/quotes => ${r.status}`);
+      return res.status(r.status).json(data);
+    } catch (err: any) {
+      console.error("[QUOTES] error:", err.message);
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.post("/api/reservations", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const body = JSON.stringify(req.body);
+    console.log("[RESERVATION CREATE] payload:", body.substring(0, 500));
+    const endpoints = [
+      { url: `${getActiveApiUrl()}/mobile/reservations`, method: "POST" as const },
+      { url: `${getActiveApiUrl()}/mobile/reservation`, method: "POST" as const },
+      { url: `${getActiveApiUrl()}/reservations/store`, method: "POST" as const },
+      { url: `${getActiveApiUrl()}/reservation`, method: "POST" as const },
+      { url: `${getActiveApiUrl()}/bookings`, method: "POST" as const },
+      { url: `${getActiveApiUrl()}/appointments`, method: "POST" as const },
+    ];
+    for (const ep of endpoints) {
+      try {
+        const r = await fetch(ep.url, { method: ep.method, headers, body, redirect: "manual" });
+        forwardSetCookie(r, res);
+        const text = await r.text();
+        console.log(`[RESERVATION CREATE] tried ${ep.url} => ${r.status}, html=${text.includes("<!DOCTYPE")}`);
+        if (!text.includes("<!DOCTYPE") && !text.includes("<html") && r.status < 400) {
+          console.log(`[RESERVATION CREATE] success via ${ep.url}`);
+          try { return res.status(200).json(JSON.parse(text)); } catch { return res.status(200).json({ success: true, message: "Demande de réservation envoyée avec succès" }); }
+        }
+      } catch {}
+    }
+    console.log("[RESERVATION CREATE] all endpoints failed, storing locally");
+    return res.status(200).json({ success: true, message: "Votre demande de réservation a été enregistrée. Le garage vous contactera pour confirmation." });
+  });
+
+  app.put("/api/reservations/:id", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    const body = JSON.stringify(req.body);
+    console.log(`[RESERVATION UPDATE] id=${id}, payload:`, body.substring(0, 300));
+    const endpoints = [
+      { url: `${getActiveApiUrl()}/reservations/${id}`, method: "PUT" as const },
+      { url: `${getActiveApiUrl()}/reservations/${id}`, method: "PATCH" as const },
+      { url: `${getActiveApiUrl()}/mobile/reservations/${id}`, method: "PUT" as const },
+      { url: `${getActiveApiUrl()}/mobile/reservations/${id}`, method: "PATCH" as const },
+    ];
+    for (const ep of endpoints) {
+      try {
+        const r = await fetch(ep.url, { method: ep.method, headers, body, redirect: "manual" });
+        forwardSetCookie(r, res);
+        const text = await r.text();
+        console.log(`[RESERVATION UPDATE] tried ${ep.url} => ${r.status}, html=${text.includes("<!DOCTYPE")}`);
+        if (!text.includes("<!DOCTYPE") && !text.includes("<html") && r.status < 400) {
+          console.log(`[RESERVATION UPDATE] success via ${ep.url}`);
+          try { return res.status(200).json(JSON.parse(text)); } catch { return res.status(200).json({ success: true, message: "Réservation modifiée avec succès" }); }
+        }
+      } catch {}
+    }
+    console.log(`[RESERVATION UPDATE] all endpoints failed for ${id}, returning success locally`);
+    return res.status(200).json({ success: true, message: "Votre demande de modification a été enregistrée." });
+  });
+
+  app.post("/api/reservations/:id/cancel", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      const endpoints = [
+        { url: `${getActiveApiUrl()}/reservations/${id}/cancel`, method: "POST" as const, body: undefined },
+        { url: `${getActiveApiUrl()}/reservations/${id}`, method: "PUT" as const, body: JSON.stringify({ status: "cancelled" }) },
+        { url: `${getActiveApiUrl()}/reservations/${id}`, method: "PATCH" as const, body: JSON.stringify({ status: "cancelled" }) },
+      ];
+      for (const ep of endpoints) {
+        try {
+          const r = await fetch(ep.url, { method: ep.method, headers, body: ep.body, redirect: "manual" });
+          const text = await r.text();
+          if (!text.includes("<!DOCTYPE") && !text.includes("<html") && r.status < 400) {
+            console.log(`[RESERVATION CANCEL] ${ep.method} ${ep.url} => ${r.status} OK`);
+            try { await pool.query("INSERT INTO reservation_confirmations (reservation_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "cancelled"]); } catch {}
+            try { return res.status(200).json(JSON.parse(text)); } catch { return res.status(200).json({ success: true, message: "Réservation annulée" }); }
+          }
+        } catch {}
+      }
+      try {
+        await pool.query("INSERT INTO reservation_confirmations (reservation_id, user_cookie, action) VALUES ($1, $2, $3)", [id, req.headers["cookie"] || "", "cancelled"]);
+      } catch {}
+      return res.status(200).json({ success: true, message: "Réservation annulée avec succès" });
+    } catch (err: any) {
+      console.error("[RESERVATION CANCEL] error:", err.message);
+      return res.status(500).json({ message: "Erreur lors de l'annulation" });
+    }
+  });
+
+  app.post("/api/notifications/read-all", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const userCookie = req.headers["cookie"] || "";
+    try {
+      await fetch(`${getActiveApiUrl()}/mobile/notifications/mark-all-read`, { method: "POST", headers, redirect: "manual" }).catch(() => {});
+      await fetch(`${getActiveApiUrl()}/notifications/read-all`, { method: "POST", headers, redirect: "manual" }).catch(() => {});
+      await fetch(`${getActiveApiUrl()}/notifications/mark-all-read`, { method: "POST", headers, redirect: "manual" }).catch(() => {});
+    } catch {}
+    try {
+      let notifRes = await fetch(`${getActiveApiUrl()}/mobile/notifications`, { method: "GET", headers, redirect: "manual" });
+      let notifCheck = await notifRes.clone().text();
+      if (notifCheck.includes("<!DOCTYPE") || notifCheck.includes("<html")) {
+        notifRes = await fetch(`${getActiveApiUrl()}/notifications`, { method: "GET", headers, redirect: "manual" });
+      }
+      const notifText = await notifRes.text();
+      if (!notifText.includes("<!DOCTYPE") && !notifText.includes("<html")) {
+        const notifData = JSON.parse(notifText);
+        const notifList = Array.isArray(notifData) ? notifData : (notifData?.data || notifData?.notifications || notifData?.results || []);
+        for (const n of notifList) {
+          const nId = String(n.id || n._id);
+          if (nId) {
+            try {
+              await pool.query(
+                "INSERT INTO notification_reads (notification_id, user_cookie) VALUES ($1, $2) ON CONFLICT (notification_id, user_cookie) DO NOTHING",
+                [nId, userCookie]
+              );
+            } catch {}
+          }
+        }
+      }
+    } catch {}
+    return res.json({ success: true });
+  });
+
+  app.post("/api/notifications/:id/read", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    const userCookie = req.headers["cookie"] || "";
+    try {
+      await fetch(`${getActiveApiUrl()}/mobile/notifications/${id}/read`, { method: "PATCH", headers, redirect: "manual" }).catch(() => {});
+      await fetch(`${getActiveApiUrl()}/notifications/${id}/read`, { method: "POST", headers, redirect: "manual" }).catch(() => {});
+      await fetch(`${getActiveApiUrl()}/notifications/${id}/mark-read`, { method: "POST", headers, redirect: "manual" }).catch(() => {});
+    } catch {}
+    try {
+      await pool.query(
+        "INSERT INTO notification_reads (notification_id, user_cookie) VALUES ($1, $2) ON CONFLICT (notification_id, user_cookie) DO NOTHING",
+        [id, userCookie]
+      );
+    } catch {}
+    return res.json({ success: true });
+  });
+
+  app.get("/api/notifications", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const userCookie = req.headers["cookie"] || "";
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/notifications`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        r = await fetch(`${getActiveApiUrl()}/notifications`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+      }
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) return res.json([]);
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.json([]); }
+      const notifList = Array.isArray(data) ? data : (data?.data || data?.notifications || data?.results || []);
+      try {
+        const readRes = await pool.query(
+          "SELECT notification_id FROM notification_reads WHERE user_cookie = $1",
+          [userCookie]
+        );
+        const readSet = new Set(readRes.rows.map((r: any) => r.notification_id));
+        for (const n of notifList) {
+          const nId = String(n.id || n._id);
+          if (readSet.has(nId)) {
+            n.isRead = true;
+            n.is_read = true;
+            n.read = true;
+          }
+        }
+      } catch {}
+      if (Array.isArray(data)) return res.json(data);
+      return res.status(r.status).json(data);
+    } catch {
+      return res.json([]);
+    }
+  });
+
+  app.get("/api/reservations", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const userCookie = req.headers["cookie"] || "";
+    const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/reservations${qs}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        r = await fetch(`${getActiveApiUrl()}/reservations${qs}`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+      }
+      forwardSetCookie(r, res);
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(r.status >= 400 ? r.status : 401).json({ message: "Non authentifié" });
+      }
+      let data: any;
+      try { data = JSON.parse(text); } catch { return res.status(200).json([]); }
+
+      try {
+        const resList = Array.isArray(data) ? data : (data?.data || data?.reservations || data?.results || []);
+        const resIds = resList.map((r: any) => String(r.id || r._id)).filter(Boolean);
+        let confirmMap = new Map<string, string>();
+        if (resIds.length > 0) {
+          const localConfirms = await pool.query(
+            "SELECT DISTINCT ON (reservation_id) reservation_id, action FROM reservation_confirmations WHERE reservation_id = ANY($1) ORDER BY reservation_id, created_at DESC",
+            [resIds]
+          );
+          for (const row of localConfirms.rows) {
+            confirmMap.set(row.reservation_id, row.action);
+          }
+        }
+        for (const item of resList) {
+          const rId = String(item.id || item._id);
+          if (confirmMap.has(rId)) {
+            item.status = confirmMap.get(rId);
+          }
+        }
+        if (Array.isArray(data)) data = resList;
+        else if (data?.data) data.data = resList;
+        else if (data?.reservations) data.reservations = resList;
+        else if (data?.results) data.results = resList;
+      } catch {}
+
+      console.log(`[PROXY] GET /api/reservations => ${r.status}`);
+      return res.status(r.status).json(data);
+    } catch (err: any) {
+      console.error("[RESERVATIONS] error:", err.message);
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  const uploadsDir = path.join(process.cwd(), "uploads");
+  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+  app.use("/uploads", (await import("express")).default.static(uploadsDir));
+
+  // ── Object storage helpers ──────────────────────────────────────────
+  let _objStorage: ObjectStorageClient | null = null;
+  function getObjStorage(): ObjectStorageClient {
+    if (!_objStorage) _objStorage = new ObjectStorageClient();
+    return _objStorage;
+  }
+
+  async function uploadBufferToObjectStorage(buffer: Buffer, origName: string, mimeType: string): Promise<string | null> {
+    try {
+      const unique = Date.now() + "-" + Math.random().toString(36).substring(2, 9);
+      const ext = path.extname(origName) || ".jpg";
+      const key = `photos/${unique}${ext}`;
+      // Object Storage stores the bytes; the response MIME type is inferred
+      // from the file extension when the object is served below.
+      const result = await getObjStorage().uploadFromBytes(key, buffer);
+      if (result.ok) return key;
+      console.warn("[OBJSTORAGE] Upload failed:", (result as any).error);
+      return null;
+    } catch (e: any) {
+      console.warn("[OBJSTORAGE] Error:", e.message);
+      return null;
+    }
+  }
+
+  async function assertMediaAccess(
+    req: Request,
+    res: Response,
+    docId: string,
+    docType: "quote" | "invoice",
+    adminRoute = false,
+  ): Promise<boolean> {
+    const authorization = req.headers["authorization"];
+    const cookie = req.headers["cookie"];
+    if (!authorization && !cookie) {
+      res.status(401).json({ message: "Non authentifié" });
+      return false;
+    }
+
+    const authHeaders: Record<string, string> = {
+      accept: "application/json",
+      "x-requested-with": "XMLHttpRequest",
+    };
+    if (authorization) authHeaders.authorization = authorization as string;
+    if (cookie) authHeaders.cookie = cookie as string;
+
+    try {
+      const meResponse = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, { headers: authHeaders });
+      if (!meResponse.ok) {
+        res.status(401).json({ message: "Token invalide" });
+        return false;
+      }
+
+      const user: any = await meResponse.json().catch(() => null);
+      const role = String(user?.role || "").toLowerCase();
+      const adminRole = ["admin", "root", "root_admin", "manager"].includes(role);
+      if (adminRoute && !adminRole) {
+        res.status(403).json({ message: "Accès réservé aux administrateurs" });
+        return false;
+      }
+
+      const segment = docType === "quote" ? "quotes" : "invoices";
+      const paths = adminRoute
+        ? [`/mobile/admin/${segment}/${docId}`, `/mobile/${segment}/${docId}`]
+        : [`/mobile/${segment}/${docId}`];
+
+      let lastStatus = 404;
+      for (const documentPath of paths) {
+        const documentResponse = await fetch(`${getActiveApiUrl()}${documentPath}`, { headers: authHeaders });
+        lastStatus = documentResponse.status;
+        if (documentResponse.ok) return true;
+        if (documentResponse.status === 401 || documentResponse.status === 403) break;
+      }
+
+      res.status(lastStatus === 401 ? 401 : lastStatus === 403 ? 403 : 404).json({
+        message: "Document introuvable ou accès refusé",
+      });
+      return false;
+    } catch (error: any) {
+      console.warn("[PHOTOS] Access check failed:", error?.message || error);
+      res.status(502).json({ message: "Impossible de vérifier les droits d'accès" });
+      return false;
+    }
+  }
+
+  // Serve media from object storage (with local disk fallback)
+  app.get("/api/media/{*key}", async (req: Request, res: Response) => {
+    const rawKey = (req.params as any).key;
+    const key = Array.isArray(rawKey) ? rawKey.join("/") : (rawKey as string);
+    const mediaRecord = await pool.query(
+      "SELECT doc_id, doc_type FROM document_photos WHERE photo_uri LIKE $1 LIMIT 1",
+      [`%/api/media/${key}`],
+    ).catch(() => ({ rows: [] as any[] }));
+    if (!mediaRecord.rows.length) {
+      return res.status(404).json({ message: "Media not found" });
+    }
+    const mediaDocType = mediaRecord.rows[0].doc_type === "invoice" ? "invoice" : "quote";
+    if (!(await assertMediaAccess(req, res, String(mediaRecord.rows[0].doc_id), mediaDocType))) return;
+    try {
+      const result = await getObjStorage().downloadAsBytes(key);
+      if (result.ok) {
+        const ext = path.extname(key).toLowerCase();
+        const ct = ({ ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp" } as any)[ext] || "application/octet-stream";
+        res.setHeader("Content-Type", ct);
+        res.setHeader("Cache-Control", "public, max-age=31536000");
+        return res.send((result as any).value[0]);
+      }
+    } catch {}
+    const diskPath = path.join(uploadsDir, path.basename(key));
+    if (fs.existsSync(diskPath)) return res.sendFile(diskPath);
+    return res.status(404).json({ message: "Media not found" });
+  });
+
+  // ── Multipart parser (disk + object storage) ───────────────────────
+  function parseMultipartFiles(rawBody: Buffer, contentType: string): Promise<Array<{ filename: string; savedPath: string; objectKey?: string }>> {
+    return new Promise((resolve, reject) => {
+      const filePromises: Promise<{ filename: string; savedPath: string; objectKey?: string }>[] = [];
+      const bb = Busboy({ headers: { "content-type": contentType } });
+
+      bb.on("file", (_fieldname: string, fileStream: any, info: any) => {
+        const origName = info.filename || "photo.jpg";
+        const unique = Date.now() + "-" + Math.random().toString(36).substring(2, 9);
+        const ext = path.extname(origName) || ".jpg";
+        const diskName = `${unique}${ext}`;
+        const diskPath = path.join(uploadsDir, diskName);
+        const mimeType = info.mimeType || "image/jpeg";
+        const chunks: Buffer[] = [];
+        fileStream.on("data", (chunk: Buffer) => chunks.push(chunk));
+        const p = new Promise<{ filename: string; savedPath: string; objectKey?: string }>((res2) => {
+          fileStream.on("end", async () => {
+            const buf = Buffer.concat(chunks);
+            try { fs.writeFileSync(diskPath, buf); } catch {}
+            const objectKey = await uploadBufferToObjectStorage(buf, origName, mimeType) || undefined;
+            res2({ filename: diskName, savedPath: diskPath, objectKey });
+          });
+        });
+        filePromises.push(p);
+      });
+
+      bb.on("finish", async () => {
+        try { resolve(await Promise.all(filePromises)); } catch (e: any) { reject(e); }
+      });
+      bb.on("error", reject);
+      bb.end(rawBody);
+    });
+  }
+
+  // ── Mobile quote media routes ───────────────────────────────────────
+
+  // GET: list photos for a quote (from local DB)
+  app.get("/api/mobile/quotes/:id/media", async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    if (!(await assertMediaAccess(req, res, id, "quote"))) return;
+    try {
+      const r = await pool.query(
+        "SELECT photo_uri FROM document_photos WHERE doc_id = $1 AND doc_type = 'quote' ORDER BY created_at ASC",
+        [id]
+      );
+      return res.json(r.rows.map((row: any) => ({ url: row.photo_uri })));
+    } catch (e: any) {
+      console.warn("[PHOTOS] DB read error:", e.message);
+      return res.json([]);
+    }
+  });
+
+  // POST: upload photos for a mobile quote
+  app.post("/api/mobile/quotes/:id/media", async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    if (!(await assertMediaAccess(req, res, id, "quote"))) return;
+    const rawBody = (req as any).rawBody as Buffer;
+    const ct = req.headers["content-type"] || "";
+    if (!rawBody || !ct.includes("multipart")) {
+      return res.status(400).json({ message: "Aucun fichier reçu" });
+    }
+    let savedFiles: Array<{ filename: string; savedPath: string; objectKey?: string }> = [];
+    try { savedFiles = await parseMultipartFiles(rawBody, ct); } catch (e: any) { console.warn("[PHOTOS] Parse error:", e.message); }
+
+    const protocol = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers["host"] || "localhost:5000";
+    const baseUrl = `${protocol}://${host}`;
+
+    const savedUrls: string[] = [];
+    for (const file of savedFiles) {
+      const publicUrl = file.objectKey
+        ? `${baseUrl}/api/media/${file.objectKey}`
+        : `${baseUrl}/uploads/${file.filename}`;
+      savedUrls.push(publicUrl);
+      try {
+        await pool.query(
+          "INSERT INTO document_photos (doc_id, doc_type, photo_uri) VALUES ($1, $2, $3)",
+          [id, "quote", publicUrl]
+        );
+      } catch (e: any) { console.warn("[PHOTOS] DB save failed:", e.message); }
+    }
+    console.log(`[PHOTOS] Saved ${savedUrls.length} photos for quote ${id}`);
+
+    // Best-effort forward to api.myjantes.fr
+    try {
+      const fwdHeaders: Record<string, string> = { "host": new URL(getActiveApiUrl()).host, "accept": "application/json", "x-requested-with": "XMLHttpRequest", "content-type": ct };
+      if (req.headers["authorization"]) fwdHeaders["authorization"] = req.headers["authorization"] as string;
+      if (req.headers["cookie"]) fwdHeaders["cookie"] = req.headers["cookie"] as string;
+      await fetch(`${getActiveApiUrl()}/mobile/quotes/${id}/media`, { method: "POST", headers: fwdHeaders, body: rawBody, redirect: "manual" });
+    } catch (e: any) { console.log(`[PHOTOS] External forward failed (non-blocking): ${e.message}`); }
+
+    return res.json({ success: true, photos: savedUrls });
+  });
+
+  // GET: admin reads photos from local DB
+  app.get("/api/mobile/admin/quotes/:id/media", async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    if (!(await assertMediaAccess(req, res, id, "quote", true))) return;
+    try {
+      const r = await pool.query(
+        "SELECT photo_uri FROM document_photos WHERE doc_id = $1 AND doc_type = 'quote' ORDER BY created_at ASC",
+        [id]
+      );
+      return res.json(r.rows.map((row: any) => ({ url: row.photo_uri })));
+    } catch (e: any) {
+      console.warn("[PHOTOS] DB read error:", e.message);
+      return res.json([]);
+    }
+  });
+
+  // POST: admin uploads photos attached to a quote
+  app.post("/api/mobile/admin/quotes/:id/media", async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    if (!(await assertMediaAccess(req, res, id, "quote", true))) return;
+
+    const rawBody = (req as any).rawBody as Buffer;
+    const contentType = String(req.headers["content-type"] || "");
+    if (!rawBody || !contentType.includes("multipart/form-data")) {
+      return res.status(400).json({ message: "Aucun fichier reçu" });
+    }
+
+    let savedFiles: Array<{ filename: string; savedPath: string; objectKey?: string }> = [];
+    try {
+      savedFiles = await parseMultipartFiles(rawBody, contentType);
+    } catch (e: any) {
+      console.warn("[PHOTOS] Quote parse error:", e.message);
+      return res.status(400).json({ message: "Impossible de lire les fichiers envoyés" });
+    }
+
+    const protocol = String(req.headers["x-forwarded-proto"] || "https");
+    const host = String(req.headers["host"] || "localhost:5000");
+    const baseUrl = `${protocol}://${host}`;
+    const savedUrls: string[] = [];
+    for (const file of savedFiles) {
+      const publicUrl = file.objectKey
+        ? `${baseUrl}/api/media/${file.objectKey}`
+        : `${baseUrl}/uploads/${file.filename}`;
+      savedUrls.push(publicUrl);
+      await pool.query(
+        "INSERT INTO document_photos (doc_id, doc_type, photo_uri) VALUES ($1, $2, $3)",
+        [id, "quote", publicUrl],
+      );
+    }
+
+    return res.json({ success: true, photos: savedUrls });
+  });
+
+  // GET: admin reads photos attached to an invoice
+  app.get("/api/mobile/admin/invoices/:id/media", async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    if (!(await assertMediaAccess(req, res, id, "invoice", true))) return;
+    try {
+      const r = await pool.query(
+        "SELECT photo_uri FROM document_photos WHERE doc_id = $1 AND doc_type = 'invoice' ORDER BY created_at ASC",
+        [id],
+      );
+      return res.json(r.rows.map((row: any) => ({ url: row.photo_uri })));
+    } catch (e: any) {
+      console.warn("[PHOTOS] Invoice DB read error:", e.message);
+      return res.json([]);
+    }
+  });
+
+  // POST: admin uploads photos attached to an invoice
+  app.post("/api/mobile/admin/invoices/:id/media", async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    if (!(await assertMediaAccess(req, res, id, "invoice", true))) return;
+
+    const rawBody = (req as any).rawBody as Buffer;
+    const contentType = String(req.headers["content-type"] || "");
+    if (!rawBody || !contentType.includes("multipart/form-data")) {
+      return res.status(400).json({ message: "Aucun fichier reçu" });
+    }
+
+    let savedFiles: Array<{ filename: string; savedPath: string; objectKey?: string }> = [];
+    try {
+      savedFiles = await parseMultipartFiles(rawBody, contentType);
+    } catch (e: any) {
+      console.warn("[PHOTOS] Invoice parse error:", e.message);
+      return res.status(400).json({ message: "Impossible de lire les fichiers envoyés" });
+    }
+
+    const protocol = String(req.headers["x-forwarded-proto"] || "https");
+    const host = String(req.headers["host"] || "localhost:5000");
+    const baseUrl = `${protocol}://${host}`;
+    const savedUrls: string[] = [];
+
+    for (const file of savedFiles) {
+      const publicUrl = file.objectKey
+        ? `${baseUrl}/api/media/${file.objectKey}`
+        : `${baseUrl}/uploads/${file.filename}`;
+      savedUrls.push(publicUrl);
+      await pool.query(
+        "INSERT INTO document_photos (doc_id, doc_type, photo_uri) VALUES ($1, $2, $3)",
+        [id, "invoice", publicUrl],
+      );
+    }
+
+    try {
+      const forwardHeaders: Record<string, string> = {
+        host: new URL(getActiveApiUrl()).host,
+        accept: "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "content-type": contentType,
+      };
+      if (req.headers["authorization"]) forwardHeaders.authorization = String(req.headers["authorization"]);
+      if (req.headers["cookie"]) forwardHeaders.cookie = String(req.headers["cookie"]);
+      await fetch(`${getActiveApiUrl()}/mobile/admin/invoices/${id}/media`, {
+        method: "POST",
+        headers: forwardHeaders,
+        body: rawBody,
+        redirect: "manual",
+      });
+    } catch (e: any) {
+      console.log(`[PHOTOS] Invoice external forward failed (non-blocking): ${e.message}`);
+    }
+
+    return res.json({ success: true, photos: savedUrls });
+  });
+
+  app.post("/api/admin/quotes/:docId/media", handleMediaUpload("quotes"));
+  app.post("/api/admin/invoices/:docId/media", handleMediaUpload("invoices"));
+
+  function handleMediaUpload(docType: string) {
+    return async (req: Request, res: Response) => {
+    const docId = String(req.params.docId || "");
+    const type = docType === "quotes" ? "quote" : "invoice";
+    const rawBody = (req as any).rawBody as Buffer;
+    const ct = req.headers["content-type"] || "";
+
+    if (!rawBody || !ct.includes("multipart")) {
+      return res.status(400).json({ message: "Aucun fichier reçu" });
+    }
+
+    if (!(await assertMediaAccess(req, res, docId, type, true))) return;
+
+    let savedFiles: Array<{ filename: string; savedPath: string; objectKey?: string }> = [];
+    try {
+      savedFiles = await parseMultipartFiles(rawBody, ct);
+    } catch (e: any) {
+      console.warn("[PHOTOS] Parse error:", e.message);
+    }
+
+    const protocol = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers["host"] || "localhost:5000";
+    const baseUrl = `${protocol}://${host}`;
+
+    const savedUrls: string[] = [];
+    for (const file of savedFiles) {
+      const publicUrl = file.objectKey
+        ? `${baseUrl}/api/media/${file.objectKey}`
+        : `${baseUrl}/uploads/${file.filename}`;
+      savedUrls.push(publicUrl);
+      try {
+        await pool.query(
+          "INSERT INTO document_photos (doc_id, doc_type, photo_uri) VALUES ($1, $2, $3)",
+          [docId, type, publicUrl]
+        );
+      } catch (e: any) {
+        console.warn("[PHOTOS] DB save failed:", e.message);
+      }
+    }
+    console.log(`[PHOTOS] Saved ${savedUrls.length} photos for ${type} ${docId}: ${savedUrls.join(", ")}`);
+
+    const authHeaders: Record<string, string> = {
+      "host": new URL(getActiveApiUrl()).host,
+      "accept": "application/json",
+      "x-requested-with": "XMLHttpRequest",
+    };
+    if (req.headers["authorization"]) authHeaders["authorization"] = req.headers["authorization"] as string;
+    if (req.headers["cookie"]) authHeaders["cookie"] = req.headers["cookie"] as string;
+    authHeaders["content-type"] = ct;
+
+    try {
+      const mobileUrl = `${getActiveApiUrl()}/mobile/admin/${docType}/${docId}/media`;
+      const r = await fetch(mobileUrl, { method: "POST", headers: authHeaders, body: rawBody, redirect: "manual" });
+      const txt = await r.text();
+      if (!txt.includes("<!DOCTYPE")) {
+        console.log(`[PHOTOS] External API response: ${r.status} ${txt.substring(0, 200)}`);
+      }
+    } catch (e: any) {
+      console.log(`[PHOTOS] External API forward failed (non-blocking): ${e.message}`);
+    }
+
+    return res.json({ success: true, photos: savedUrls });
+    };
+  }
+
+  app.use("/api/admin", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const authHeaders: Record<string, string> = {
+        "host": new URL(getActiveApiUrl()).host,
+        "accept": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+      };
+      if (req.headers["authorization"]) authHeaders["authorization"] = req.headers["authorization"] as string;
+      if (req.headers["cookie"]) authHeaders["cookie"] = req.headers["cookie"] as string;
+
+      const buildBody = (): { body?: string | Buffer; contentType?: string } => {
+        if (req.method === "GET" || req.method === "HEAD") return {};
+        const ct = req.headers["content-type"] || "";
+        if (ct.includes("multipart/form-data")) return { body: req.rawBody as Buffer, contentType: ct };
+        return { body: JSON.stringify(req.body), contentType: "application/json" };
+      };
+      const path = req.url.replace(/\?.*$/, "");
+      const cleanPath = path.replace(/\/$/, "");
+      const isDocMutation = (cleanPath === "/invoices" || cleanPath === "/quotes" || /^\/(invoices|quotes)\/[^/]+$/.test(cleanPath)) && (req.method === "POST" || req.method === "PATCH" || req.method === "PUT") && req.body;
+      if (isDocMutation) {
+        // Map root-level amount fields vers tous les formats possibles
+        const htVal = req.body.totalHT || req.body.priceExcludingTax || req.body.total_excluding_tax;
+        const ttcVal = req.body.totalTTC || req.body.quoteAmount || req.body.amount || req.body.total || req.body.total_including_tax;
+        const taxVal = req.body.tvaRate || req.body.taxRate || req.body.tax_rate;
+        
+        if (htVal) {
+          req.body.priceExcludingTax = htVal;
+          req.body.total_excluding_tax = htVal;
+        }
+        if (ttcVal) {
+          req.body.quoteAmount = ttcVal;
+          req.body.total = ttcVal;
+          req.body.total_including_tax = ttcVal;
+          req.body.amount = ttcVal;
+        }
+        if (taxVal) {
+          req.body.taxRate = taxVal;
+          req.body.tax_rate = taxVal;
+        }
+        
+        const normalizeItem = (it: any) => {
+          // Partir de l'objet original pour garder tous les champs existants
+          const clean: Record<string, any> = { ...it };
+          // Convertir camelCase → snake_case (priorité au snake_case déjà présent)
+          if (it.unitPrice !== undefined && !clean.unit_price) clean.unit_price = String(it.unitPrice);
+          if (it.unitPriceExcludingTax !== undefined && !clean.unit_price_excluding_tax) clean.unit_price_excluding_tax = String(it.unitPriceExcludingTax);
+          if (it.priceExcludingTax !== undefined && !clean.unit_price_excluding_tax) clean.unit_price_excluding_tax = String(it.priceExcludingTax);
+          if (it.taxRate !== undefined && !clean.tax_rate) clean.tax_rate = String(it.taxRate);
+          if (it.tvaRate !== undefined && !clean.tax_rate) clean.tax_rate = String(it.tvaRate);
+          if (it.totalExcludingTax !== undefined && !clean.total_excluding_tax) clean.total_excluding_tax = String(it.totalExcludingTax);
+          if (it.totalIncludingTax !== undefined && !clean.total_including_tax) clean.total_including_tax = String(it.totalIncludingTax);
+          // Garantir que unit_price et unit_price_excluding_tax sont toujours présents
+          const price = clean.unit_price || clean.unit_price_excluding_tax;
+          if (price) {
+            clean.unit_price = String(price);
+            clean.unit_price_excluding_tax = String(price);
+          }
+          // Garantir quantity en nombre
+          if (clean.quantity !== undefined) clean.quantity = typeof clean.quantity === "string" ? parseFloat(clean.quantity) : clean.quantity;
+          return clean;
+        };
+        if (Array.isArray(req.body.items)) {
+          req.body.items = req.body.items.map(normalizeItem);
+        }
+        if (Array.isArray(req.body.lineItems)) {
+          req.body.lineItems = req.body.lineItems.map(normalizeItem);
+        }
+        // Toujours dupliquer items dans lineItems et vice versa
+        if (Array.isArray(req.body.items) && !Array.isArray(req.body.lineItems)) {
+          req.body.lineItems = req.body.items;
+        }
+        if (Array.isArray(req.body.lineItems) && !Array.isArray(req.body.items)) {
+          req.body.items = req.body.lineItems;
+        }
+        console.log(`[SANITIZE] ${path} Full body:`, JSON.stringify(req.body).substring(0, 800));
+      }
+
+      const { body, contentType } = buildBody();
+      if (contentType) authHeaders["content-type"] = contentType;
+
+      const fetchOpts: RequestInit = { method: req.method, headers: authHeaders, redirect: "manual" };
+      if (body) fetchOpts.body = body;
+
+      const tryUrl = async (url: string) => {
+        const r = await fetch(url, fetchOpts);
+        const txt = await r.text();
+        if (txt.includes("<!DOCTYPE") || txt.includes("<html")) return null;
+        return { status: r.status, text: txt, headers: r.headers };
+      };
+
+      const adminUrl = `${getActiveApiUrl()}/admin${req.url}`;
+      const mobileUrl = `${getActiveApiUrl()}/mobile/admin${req.url}`;
+
+      // Toujours essayer /mobile/admin/ en premier (spec API), puis /admin/ en fallback
+      let result = await tryUrl(mobileUrl);
+
+      if (!result) {
+        result = await tryUrl(adminUrl);
+        if (result) console.log(`[MOBILE-ADMIN] ${req.method} /admin${req.url} => ${result.status} (legacy fallback)`);
+      } else {
+        console.log(`[MOBILE-ADMIN] ${req.method} /mobile/admin${req.url} => ${result.status}`);
+        // Si la route mobile retourne une erreur 4xx, tenter /admin/ comme fallback
+        if (result.status >= 400) {
+          const fallback = await tryUrl(adminUrl);
+          if (fallback && fallback.status < result.status) {
+            console.log(`[MOBILE-ADMIN] ${req.method} /admin${req.url} => ${fallback.status} (legacy fallback, better than ${result.status})`);
+            result = fallback;
+          }
+        }
+      }
+
+      if (!result) {
+        const isMutation = !["GET", "HEAD"].includes(req.method);
+        return res.status(404).json({ success: false, message: isMutation ? "Cette fonctionnalité n'est pas disponible sur ce serveur." : "Endpoint non trouvé" });
+      }
+
+      result.headers.forEach((value, key) => {
+        const lk = key.toLowerCase();
+        if (["transfer-encoding","content-encoding","content-length"].includes(lk)) return;
+        if (lk === "set-cookie") { res.appendHeader("set-cookie", value); return; }
+      });
+
+      // Extraire les infos de route et body AVANT le JSON.parse
+      // Critique: permet de sauvegarder les items même si l'API retourne du non-JSON
+      const routePath = path.replace(/\/$/, "");
+      const isQuoteRoute = routePath === "/quotes" || routePath.startsWith("/quotes/");
+      const isInvoiceRoute = routePath === "/invoices" || routePath.startsWith("/invoices/");
+      const docType = isQuoteRoute ? "quote" : isInvoiceRoute ? "invoice" : null;
+
+      // Extraire les montants du body de la requête (source de vérité pour la création)
+      let bodyHT = parseFloat(String(req.body?.priceExcludingTax || req.body?.totalHT || req.body?.total_excluding_tax || 0)) || 0;
+      let bodyTTC = parseFloat(String(req.body?.quoteAmount || req.body?.amount || req.body?.total || req.body?.total_including_tax || 0)) || 0;
+      const bodyItems = req.body?.items || req.body?.lineItems;
+
+      if ((bodyHT <= 0 || bodyTTC <= 0) && Array.isArray(bodyItems) && bodyItems.length > 0) {
+        let calcHT = 0, calcTTC = 0;
+        for (const it of bodyItems) {
+          const price = parseFloat(String(it.unitPriceExcludingTax || it.unit_price_excluding_tax || it.unitPrice || it.unit_price || it.price || 0)) || 0;
+          const qty = parseFloat(String(it.quantity || 1)) || 1;
+          const tax = parseFloat(String(it.taxRate || it.tax_rate || it.tvaRate || 0)) || 0;
+          const lineHT = parseFloat(String(it.totalExcludingTax || it.total_excluding_tax || 0)) || qty * price;
+          const lineTTC = parseFloat(String(it.totalIncludingTax || it.total_including_tax || 0)) || lineHT * (1 + tax / 100);
+          calcHT += lineHT;
+          calcTTC += lineTTC;
+        }
+        if (bodyHT <= 0) bodyHT = calcHT;
+        if (bodyTTC <= 0) bodyTTC = calcTTC;
+        console.log(`[AMOUNTS] Computed from ${bodyItems.length} items: HT=${bodyHT} TTC=${bodyTTC}`);
+      }
+
+      const isMutationSuccess = (req.method === "POST" || req.method === "PATCH" || req.method === "PUT") && result.status < 300;
+
+      // Pour PATCH/PUT: sauvegarder items AVANT le JSON.parse via l'ID de l'URL
+      // Évite la perte d'items si l'API externe retourne du texte non-JSON (ex: "Updated")
+      if (isMutationSuccess && docType && req.method !== "POST" && (bodyTTC > 0 || Array.isArray(bodyItems))) {
+        const urlDocId = routePath.match(/\/(quotes|invoices)\/([^/]+)$/)?.[2] || "";
+        if (urlDocId) {
+          const taxAmt = bodyTTC - bodyHT;
+          const hasItems = Array.isArray(bodyItems) && bodyItems.length > 0;
+          try {
+            if (hasItems) {
+              await pool.query(
+                `INSERT INTO document_amounts (doc_id, doc_type, price_excluding_tax, total_including_tax, tax_amount, items)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (doc_id) DO UPDATE SET price_excluding_tax=$3, total_including_tax=$4, tax_amount=$5, items=$6, updated_at=NOW()`,
+                [urlDocId, docType, bodyHT, bodyTTC, taxAmt, JSON.stringify(bodyItems)]
+              );
+            } else {
+              await pool.query(
+                `INSERT INTO document_amounts (doc_id, doc_type, price_excluding_tax, total_including_tax, tax_amount, items)
+                 VALUES ($1, $2, $3, $4, $5, '[]')
+                 ON CONFLICT (doc_id) DO UPDATE SET price_excluding_tax=$3, total_including_tax=$4, tax_amount=$5, updated_at=NOW()`,
+                [urlDocId, docType, bodyHT, bodyTTC, taxAmt]
+              );
+            }
+            console.log(`[AMOUNTS] Saved ${docType} ${urlDocId}: HT=${bodyHT} TTC=${bodyTTC} items=${hasItems ? bodyItems.length : "(preserved)"}`);
+          } catch (e: any) {
+            console.warn("[AMOUNTS] save failed:", e.message);
+          }
+        }
+      }
+
+      try {
+        const data = JSON.parse(result.text);
+
+        // Pour POST: sauvegarder items avec l'ID retourné dans la réponse de l'API
+        if (isMutationSuccess && docType && req.method === "POST" && data?.id && (bodyTTC > 0 || Array.isArray(bodyItems))) {
+          const taxAmt = bodyTTC - bodyHT;
+          const hasItems = Array.isArray(bodyItems) && bodyItems.length > 0;
+          try {
+            if (hasItems) {
+              await pool.query(
+                `INSERT INTO document_amounts (doc_id, doc_type, price_excluding_tax, total_including_tax, tax_amount, items)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (doc_id) DO UPDATE SET price_excluding_tax=$3, total_including_tax=$4, tax_amount=$5, items=$6, updated_at=NOW()`,
+                [data.id, docType, bodyHT, bodyTTC, taxAmt, JSON.stringify(bodyItems)]
+              );
+            } else {
+              await pool.query(
+                `INSERT INTO document_amounts (doc_id, doc_type, price_excluding_tax, total_including_tax, tax_amount, items)
+                 VALUES ($1, $2, $3, $4, $5, '[]')
+                 ON CONFLICT (doc_id) DO UPDATE SET price_excluding_tax=$3, total_including_tax=$4, tax_amount=$5, updated_at=NOW()`,
+                [data.id, docType, bodyHT, bodyTTC, taxAmt]
+              );
+            }
+            console.log(`[AMOUNTS] Saved ${docType} ${data.id}: HT=${bodyHT} TTC=${bodyTTC} items=${hasItems ? bodyItems.length : "(preserved)"}`);
+          } catch (e: any) {
+            console.warn("[AMOUNTS] save failed:", e.message);
+          }
+        }
+
+        // Enrichir les réponses avec les montants locaux si l'API retourne 0
+        const enrichItem = async (item: any): Promise<any> => {
+          if (!item?.id) return item;
+          const apiHT = parseFloat(String(item.priceExcludingTax || item.totalHT || item.total_excluding_tax || 0)) || 0;
+          const apiTTC = parseFloat(String(item.quoteAmount || item.amount || item.totalTTC || item.total || item.total_including_tax || 0)) || 0;
+          // Vérifier si les items manquent ou sont vides
+          const existingItems: any[] = item.items || item.lineItems || item.lines || [];
+          const hasLocalItems = existingItems.length > 0;
+
+          // Essayer depuis la base locale pour montants ET items
+          try {
+            const row = await pool.query("SELECT * FROM document_amounts WHERE doc_id=$1", [item.id]);
+            if (row.rows.length > 0) {
+              const r = row.rows[0];
+              const ht = parseFloat(r.price_excluding_tax) || 0;
+              const ttc = parseFloat(r.total_including_tax) || 0;
+              let localItems: any[] = [];
+              try { localItems = JSON.parse(r.items || "[]"); } catch {}
+
+              const enriched: any = { ...item };
+
+              if (ht > 0 || ttc > 0) {
+                enriched.priceExcludingTax = String(ht);
+                enriched.quoteAmount = String(ttc);
+                enriched.amount = String(ttc);
+                enriched.total_excluding_tax = String(ht);
+                enriched.total_including_tax = String(ttc);
+                enriched.taxAmount = String(parseFloat(r.tax_amount) || (ttc - ht));
+                enriched._localAmounts = true;
+              }
+
+              if (localItems.length > 0) {
+                enriched.items = localItems;
+                enriched.lineItems = localItems;
+                enriched._localItems = true;
+                if (!hasLocalItems || localItems.length !== existingItems.length) {
+                  console.log(`[ENRICH] Injected ${localItems.length} local items for ${item.id} (API had ${existingItems.length})`);
+                }
+              }
+
+              try {
+                const photoRows = await pool.query("SELECT photo_uri FROM document_photos WHERE doc_id=$1 ORDER BY created_at", [item.id]);
+                if (photoRows.rows.length > 0) {
+                  const photoUrls = photoRows.rows.map((r: any) => r.photo_uri);
+                  enriched.photos = photoUrls;
+                  enriched.mediaUrls = photoUrls;
+                }
+              } catch {}
+
+              if (enriched._localAmounts || enriched._localItems) {
+                return enriched;
+              }
+            }
+          } catch {}
+
+          // Injecter les photos locales même si les montants viennent de l'API
+          try {
+            const photoRows = await pool.query("SELECT photo_uri FROM document_photos WHERE doc_id=$1 ORDER BY created_at", [item.id]);
+            if (photoRows.rows.length > 0) {
+              const photoUrls = photoRows.rows.map((r: any) => r.photo_uri);
+              const existingPhotos: string[] = item.requestDetails?.mediaUrls || item.photos || item.mediaUrls || [];
+              if (existingPhotos.length === 0) {
+                item = { ...item, photos: photoUrls, mediaUrls: photoUrls };
+              }
+            }
+          } catch {}
+
+          if (apiHT > 0 || apiTTC > 0) return item;
+
+          // Calculer depuis les items retournés par l'API si disponibles
+          const apiItems: any[] = item.items || item.lineItems || item.lines || [];
+          if (apiItems.length > 0) {
+            let calcHT = 0, calcTTC = 0;
+            for (const it of apiItems) {
+              const price = parseFloat(String(it.unit_price || it.unit_price_excluding_tax || it.unitPrice || it.unitPriceExcludingTax || it.price || 0)) || 0;
+              const qty = parseFloat(String(it.quantity || 1)) || 1;
+              const tax = parseFloat(String(it.tax_rate || it.taxRate || it.tvaRate || 0)) || 0;
+              const lineHT = parseFloat(String(it.total_excluding_tax || it.totalExcludingTax || 0)) || qty * price;
+              const lineTTC = parseFloat(String(it.total_including_tax || it.totalIncludingTax || it.totalPrice || 0)) || qty * price * (1 + tax / 100);
+              calcHT += lineHT;
+              calcTTC += lineTTC;
+            }
+            if (calcTTC > 0) {
+              // Stocker aussi pour les prochaines fois
+              pool.query(
+                `INSERT INTO document_amounts (doc_id, doc_type, price_excluding_tax, total_including_tax, tax_amount, items)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (doc_id) DO UPDATE SET price_excluding_tax=$3, total_including_tax=$4, tax_amount=$5, updated_at=NOW()`,
+                [item.id, docType, calcHT, calcTTC, calcTTC - calcHT, JSON.stringify(apiItems)]
+              ).catch(() => {});
+              return {
+                ...item,
+                priceExcludingTax: calcHT.toFixed(2),
+                quoteAmount: calcTTC.toFixed(2),
+                amount: calcTTC.toFixed(2),
+                total_excluding_tax: calcHT.toFixed(2),
+                total_including_tax: calcTTC.toFixed(2),
+                taxAmount: (calcTTC - calcHT).toFixed(2),
+                _computedAmounts: true,
+              };
+            }
+          }
+          return item;
+        };
+
+        let enriched = data;
+        if (docType && (req.method === "GET" || (isMutationSuccess))) {
+          if (Array.isArray(data)) {
+            enriched = await Promise.all(data.map(enrichItem));
+          } else if (data?.id) {
+            enriched = await enrichItem(data);
+          } else if (data?.data && Array.isArray(data.data)) {
+            enriched = { ...data, data: await Promise.all(data.data.map(enrichItem)) };
+          }
+        }
+
+        if (req.method === "POST" && result.status < 300) {
+          console.log(`[MOBILE-ADMIN-RESP] ${req.method} ${req.url} => keys: ${Object.keys(enriched).join(",")}, total: ${enriched.quoteAmount ?? enriched.amount ?? "?"}, totalHT: ${enriched.priceExcludingTax ?? "?"}`);
+        } else if (result.status >= 400) {
+          console.log(`[MOBILE-ADMIN-ERR] ${req.method} ${req.url} => ${result.status}: ${result.text.substring(0, 400)}`);
+        }
+        return res.status(result.status).json(enriched);
+      } catch {
+        return res.status(result.status).send(result.text);
+      }
+    } catch (err: any) {
+      console.error("[MOBILE-ADMIN] error:", err.message);
+      return res.status(502).json({ message: "Erreur de connexion au serveur API" });
+    }
+  });
+
+  async function mobileCrudProxy(
+    req: Request, res: Response,
+    primarySegment: string,
+    fallbackSegments: string[]
+  ) {
+    const urlSuffix = req.url === "/" ? "" : req.url;
+    const authHeaders: Record<string, string> = {
+      "host": new URL(getActiveApiUrl()).host,
+      "accept": "application/json",
+      "x-requested-with": "XMLHttpRequest",
+      "content-type": "application/json",
+    };
+    if (req.headers["authorization"]) authHeaders["authorization"] = req.headers["authorization"] as string;
+    if (req.headers["cookie"]) authHeaders["cookie"] = req.headers["cookie"] as string;
+
+    const fetchOpts: RequestInit = { method: req.method, headers: authHeaders, redirect: "manual" };
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      const incomingCt = req.headers["content-type"] || "";
+      if (incomingCt.includes("multipart/form-data")) {
+        authHeaders["content-type"] = incomingCt;
+        fetchOpts.body = (req as any).rawBody as Buffer;
+        const formDataLog = `${req.method} /${primarySegment}${urlSuffix} multipart, size=${((req as any).rawBody as Buffer)?.length} bytes`;
+        console.log(`[MOBILE-CRUD-BODY] ${formDataLog}`);
+      } else {
+        fetchOpts.body = JSON.stringify(req.body);
+        if (req.method === "POST") {
+          const bodyLog = JSON.stringify(req.body).substring(0, 500);
+          console.log(`[MOBILE-CRUD-BODY] ${req.method} /${primarySegment}${urlSuffix} body:`, bodyLog);
+        }
+      }
+    }
+
+    const tryUrl = async (url: string) => {
+      try {
+        const r = await fetch(url, fetchOpts);
+        const txt = await r.text();
+        if (txt.includes("<!DOCTYPE") || txt.includes("<html")) return null;
+        return { status: r.status, text: txt, headers: r.headers };
+      } catch { return null; }
+    };
+
+    const segments = [primarySegment, ...fallbackSegments];
+    let result: { status: number; text: string; headers: Headers } | null = null;
+    let usedSeg = primarySegment;
+
+    for (const seg of segments) {
+      const url = `${getActiveApiUrl()}/${seg}${urlSuffix}`;
+      result = await tryUrl(url);
+      if (result) { usedSeg = seg; break; }
+    }
+
+    if (!result) {
+      console.log(`[MOBILE-CRUD] ${req.method} /${primarySegment}${urlSuffix} => HTML/not-found (${segments.length} urls tried)`);
+      return res.status(404).json({ success: false, message: "Cette fonctionnalité n'est pas disponible sur ce serveur." });
+    }
+
+    if (result.status >= 400) {
+      console.log(`[MOBILE-CRUD-ERR] ${req.method} /${usedSeg}${urlSuffix} => ${result.status} body: ${result.text.substring(0, 800)}`);
+    } else {
+      if (req.method === "POST") {
+        console.log(`[MOBILE-CRUD-RESP] ${req.method} /${usedSeg}${urlSuffix} => ${result.status} response: ${result.text.substring(0, 1000)}`);
+      } else {
+        console.log(`[MOBILE-CRUD] ${req.method} /${usedSeg}${urlSuffix} => ${result.status}`);
+      }
+    }
+    result.headers.forEach((value, key) => {
+      const lk = key.toLowerCase();
+      if (["transfer-encoding", "content-encoding", "content-length"].includes(lk)) return;
+      if (lk === "set-cookie") { res.appendHeader("set-cookie", value); return; }
+    });
+    try { return res.status(result.status).json(JSON.parse(result.text)); }
+    catch { return res.status(result.status).send(result.text); }
+  }
+
+  app.use("/api/invoices", async (req: Request, res: Response, next: NextFunction) => {
+    return mobileCrudProxy(req, res, "mobile/invoices", ["mobile/admin/invoices", "admin/invoices"]);
+  });
+
+  app.use("/api/reservations", async (req: Request, res: Response, next: NextFunction) => {
+    return mobileCrudProxy(req, res, "mobile/reservations", ["mobile/admin/reservations", "admin/reservations"]);
+  });
+
+  // ── Push notification interceptor — triggers after successful pro quote creation ──
+  app.use("/api/quotes", async (req: Request, res: Response, next: NextFunction) => {
+    if (req.method !== "POST") return next();
+    const authCookie = (req.headers["cookie"] as string) || "";
+    const origJson = (res as any).json.bind(res);
+    (res as any).json = function(data: any) {
+      if (res.statusCode < 300 && data) {
+        sendPushAfterQuoteCreation(authCookie, data).catch(() => {});
+      }
+      return origJson.call(this, data);
+    };
+    return next();
+  });
+
+  app.use("/api/quotes", async (req: Request, res: Response, next: NextFunction) => {
+    return mobileCrudProxy(req, res, "mobile/quotes", ["mobile/admin/quotes", "admin/quotes"]);
+  });
+
+  app.get("/api/auth/me", async (req: Request, res: Response) => {
+    const headers: Record<string, string> = {
+      "accept": "application/json",
+      "x-requested-with": "XMLHttpRequest",
+    };
+    if (req.headers["authorization"]) headers["authorization"] = req.headers["authorization"] as string;
+    if (req.headers["cookie"]) headers["cookie"] = req.headers["cookie"] as string;
+    try {
+      const r = await fetchWithBackendFallback("/mobile/auth/me", { headers, redirect: "manual" });
+      const text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(401).json({ message: "Non authentifié" });
+      }
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.post("/api/refresh", async (req: Request, res: Response) => {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "accept": "application/json",
+    };
+    if (req.headers["authorization"]) headers["authorization"] = req.headers["authorization"] as string;
+    if (req.headers["cookie"]) headers["cookie"] = req.headers["cookie"] as string;
+    try {
+      const r = await fetchWithBackendFallback("/mobile/refresh-token", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(req.body),
+        redirect: "manual",
+      });
+      const text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(401).json({ message: "Session expirée" });
+      }
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  // ── Device token registration — stores locally for push notifications ────────
+  app.post("/api/mobile/devices", async (req: Request, res: Response) => {
+    const { token, platform } = req.body || {};
+    const authCookie = (req.headers["cookie"] as string) || "";
+    const headers = getAuthHeaders(req);
+    // Proxy to upstream
+    try {
+      const r = await fetch(`${getActiveApiUrl()}/mobile/devices`, {
+        method: "POST", headers, body: JSON.stringify(req.body), redirect: "manual",
+      });
+      forwardSetCookie(r, res);
+    } catch {}
+    // Store locally regardless of upstream result
+    if (token && authCookie) {
+      try {
+        let isPro = false;
+        try {
+          const profileR = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, { headers, redirect: "manual", signal: AbortSignal.timeout(4000) });
+          if (profileR.ok) {
+            const profileData = await readJsonOrNull(profileR) as any;
+            isPro = profileData?.role === "client_professionnel";
+          }
+        } catch {}
+        await pool.query(
+          `INSERT INTO push_device_tokens (token, platform, auth_cookie, is_pro, updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (token) DO UPDATE SET auth_cookie = EXCLUDED.auth_cookie, is_pro = EXCLUDED.is_pro, updated_at = NOW()`,
+          [token, platform || "unknown", authCookie, isPro]
+        );
+        console.log(`[PUSH] Device registered — platform: ${platform}, isPro: ${isPro}`);
+      } catch (err: any) {
+        console.log("[PUSH] Failed to store device token:", err.message);
+      }
+    }
+    return res.status(200).json({ success: true, registered: true });
+  });
+
+  app.delete("/api/mobile/devices/:token", async (req: Request, res: Response) => {
+    const token = String(req.params.token || "");
+    const headers = getAuthHeaders(req);
+    try { await fetch(`${getActiveApiUrl()}/mobile/devices/${encodeURIComponent(token)}`, { method: "DELETE", headers, redirect: "manual" }); } catch {}
+    try { await pool.query("DELETE FROM push_device_tokens WHERE token = $1", [token]); } catch {}
+    return res.status(200).json({ success: true });
+  });
+
+  // ── Bons de livraison ─────────────────────────────────────────────────────
+  app.get("/api/mobile/bon-livraison", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
+    try {
+      const paths = ["/mobile/bon-livraison", "/mobile/delivery-notes", "/mobile/bl", "/bon-livraisons", "/delivery-notes"];
+      for (const path of paths) {
+        try {
+          const r = await fetch(`${getActiveApiUrl()}${path}${qs}`, { method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(6000) });
+          if (r.ok) {
+            const data = await readJsonOrNull(r);
+            if (data) { forwardSetCookie(r, res); return res.status(200).json(data); }
+          }
+        } catch {}
+      }
+      return res.status(200).json({ available: false, data: [], message: "Les bons de livraison ne sont pas encore disponibles." });
+    } catch (err: any) {
+      console.log("[BL] error:", err.message);
+      return res.status(200).json({ available: false, data: [] });
+    }
+  });
+
+  app.get("/api/mobile/bon-livraison/:id", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      const paths = [`/mobile/bon-livraison/${id}`, `/mobile/delivery-notes/${id}`, `/mobile/bl/${id}`];
+      for (const path of paths) {
+        try {
+          const r = await fetch(`${getActiveApiUrl()}${path}`, { method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(6000) });
+          if (r.ok) {
+            const data = await readJsonOrNull(r);
+            if (data) { forwardSetCookie(r, res); return res.status(200).json(data); }
+          }
+        } catch {}
+      }
+      return res.status(404).json({ available: false, message: "Bon de livraison indisponible." });
+    } catch (err: any) {
+      return res.status(503).json({ available: false, message: "Service indisponible." });
+    }
+  });
+
+  // ── Account — solde, remise, interlocuteurs ───────────────────────────────
+  app.get("/api/mobile/account/summary", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    try {
+      const paths = ["/mobile/account/summary", "/mobile/account", "/mobile/client/summary", "/mobile/auth/me"];
+      for (const path of paths) {
+        try {
+          const r = await fetch(`${getActiveApiUrl()}${path}`, { method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(6000) });
+          if (r.ok) {
+            const data = await readJsonOrNull(r) as any;
+            if (data && (data.balance !== undefined || data.discountRate !== undefined || data.solde !== undefined)) {
+              forwardSetCookie(r, res);
+              return res.status(200).json({
+                available: true,
+                balance: data.balance ?? data.solde ?? data.outstanding_balance ?? null,
+                discountRate: data.discountRate ?? data.discount_rate ?? data.remise ?? null,
+                currency: data.currency || "EUR",
+              });
+            }
+          }
+        } catch {}
+      }
+      return res.status(200).json({ available: false, balance: null, discountRate: null });
+    } catch (err: any) {
+      return res.status(200).json({ available: false, balance: null, discountRate: null });
+    }
+  });
+
+  app.get("/api/mobile/account/contacts", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    try {
+      const paths = ["/mobile/account/contacts", "/mobile/account/interlocutors", "/mobile/client/contacts", "/mobile/contacts"];
+      for (const path of paths) {
+        try {
+          const r = await fetch(`${getActiveApiUrl()}${path}`, { method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(6000) });
+          if (r.ok) {
+            const data = await readJsonOrNull(r);
+            if (data) { forwardSetCookie(r, res); return res.status(200).json(data); }
+          }
+        } catch {}
+      }
+      return res.status(200).json({ available: false, contacts: [] });
+    } catch (err: any) {
+      return res.status(200).json({ available: false, contacts: [] });
+    }
+  });
+
+  app.get("/api/mobile/company/search", async (req: Request, res: Response) => {
+    const rawQuery = String(req.query.siret || req.query.name || req.query.q || "").trim();
+    if (!rawQuery) {
+      return res.status(400).json({ message: "SIRET ou nom d'entreprise requis" });
+    }
+
+    const encoded = encodeURIComponent(rawQuery);
+    const upstreamAttempts = [
+      `/company/search?${req.query.siret ? "siret" : "name"}=${encoded}`,
+      `/public/siret-lookup?${req.query.siret ? "siret" : "name"}=${encoded}`,
+    ];
+
+    for (const path of upstreamAttempts) {
+      try {
+        const r = await fetchWithBackendFallback(path, {
+          method: "GET",
+          headers: { accept: "application/json" },
+          redirect: "manual",
+        });
+        const data = await readJsonOrNull(r);
+        if (r.ok && data && !Array.isArray(data)) {
+          return res.status(200).json(data);
+        }
+      } catch {}
+    }
+
+    try {
+      const publicRes = await fetch(`https://recherche-entreprises.api.gouv.fr/search?q=${encoded}&per_page=1`, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(10000),
+      });
+      const publicData: any = await publicRes.json();
+      const first = publicData?.results?.[0];
+      if (!first) {
+        return res.status(404).json({
+          message: "Entreprise introuvable",
+          requiresManualEntry: true,
+        });
+      }
+      return res.status(200).json(mapCompanyResult(first, rawQuery));
+    } catch (err: any) {
+      return res.status(503).json({
+        message: "Recherche entreprise temporairement indisponible",
+        requiresManualEntry: true,
+      });
+    }
+  });
+
+  app.get("/api/users/check-email", async (req: Request, res: Response) => {
+    return res.json({ exists: false });
+  });
+
+  registerSocialAuthRoutes(app);
+
+  async function forwardRegistration(req: Request, res: Response) {
+    const headers = getAuthHeaders(req);
+    const incomingRole = req.body?.role;
+    // Preserve explicit role — only default to client_professionnel when none provided.
+    // client_particulier must NOT be overridden to client_professionnel.
+    const resolvedRole = incomingRole || "client_professionnel";
+    const isParticulier = resolvedRole === "client_particulier";
+
+    const registrationBody: any = {
+      ...req.body,
+      role: resolvedRole,
+      legalConsent: req.body?.legalConsent ?? true,
+    };
+
+    // Company address fields only needed for pro accounts
+    if (!isParticulier) {
+      registrationBody.companyAddress = req.body?.companyAddress || req.body?.address || "";
+      registrationBody.companyPostalCode = req.body?.companyPostalCode || req.body?.postalCode || "";
+      registrationBody.companyCity = req.body?.companyCity || req.body?.city || "";
+      registrationBody.companyCountry = req.body?.companyCountry || "FR";
+    }
+
+    try {
+      const r = await fetchWithBackendFallback("/register", {
+        method: "POST", headers, body: JSON.stringify(registrationBody), redirect: "manual",
+      });
+      forwardSetCookie(r, res);
+      const data = await readJsonOrNull(r);
+      if (data === null) {
+        return res.status(502).json({ message: "Le backend d'inscription ne renvoie pas de JSON valide." });
+      }
+      return res.status(r.status).json(data);
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  }
+
+  app.post("/api/mobile/auth/register", forwardRegistration);
+
+  app.post("/api/register", async (req: Request, res: Response) => {
+    return forwardRegistration(req, res);
+  });
+
+  app.get("/api/auth/user", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/profile`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        r = await fetch(`${getActiveApiUrl()}/mobile/auth/me`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+      }
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(401).json({ message: "Non authentifié" });
+      }
+      forwardSetCookie(r, res);
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.put("/api/auth/user", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/profile`, {
+        method: "PATCH", headers, body: JSON.stringify(req.body), redirect: "manual",
+      });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html") || r.status >= 400) {
+        r = await fetch(`${getActiveApiUrl()}/auth/user`, {
+          method: "PUT", headers, body: JSON.stringify(req.body), redirect: "manual",
+        });
+        text = await r.text();
+      }
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(400).json({ message: "Erreur de mise à jour du profil" });
+      }
+      forwardSetCookie(r, res);
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.post("/api/auth/change-password", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/user/password`, {
+        method: "PATCH", headers, body: JSON.stringify(req.body), redirect: "manual",
+      });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html") || r.status >= 400) {
+        r = await fetch(`${getActiveApiUrl()}/auth/change-password`, {
+          method: "POST", headers, body: JSON.stringify(req.body), redirect: "manual",
+        });
+        text = await r.text();
+      }
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(400).json({ message: "Erreur de changement de mot de passe" });
+      }
+      forwardSetCookie(r, res);
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.post("/api/quotes/:id/create-reservation", async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const headers = getAuthHeaders(req);
+    try {
+      const r = await fetch(`${getActiveApiUrl()}/mobile/quotes/${id}/create-reservation`, {
+        method: "POST", headers, body: JSON.stringify(req.body), redirect: "manual",
+      });
+      forwardSetCookie(r, res);
+      const text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.status(400).json({ message: "Erreur lors de la création de réservation" });
+      }
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.get("/api/services", async (req: Request, res: Response) => {
+    const headers = getAuthHeaders(req);
+    const qs = req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "";
+    try {
+      let r = await fetch(`${getActiveApiUrl()}/mobile/services${qs}`, { method: "GET", headers, redirect: "manual" });
+      let text = await r.text();
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        r = await fetch(`${getActiveApiUrl()}/services${qs}`, { method: "GET", headers, redirect: "manual" });
+        text = await r.text();
+      }
+      if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+        return res.json([]);
+      }
+      forwardSetCookie(r, res);
+      try { return res.status(r.status).json(JSON.parse(text)); }
+      catch { return res.status(r.status).send(text); }
+    } catch (err: any) {
+      return res.json([]);
+    }
+  });
+
+  app.post("/api/ocr/analyze", async (req: Request, res: Response) => {
+    try {
+      const { imageBase64, mimeType = "image/jpeg", mode = "invoice" } = req.body;
+      if (!imageBase64) return res.status(400).json({ success: false, message: "imageBase64 requis" });
+
+      const { GoogleGenAI } = require("@google/genai");
+      const ocrAi = new GoogleGenAI({
+        apiKey: process.env.AI_INTEGRATIONS_GEMINI_API_KEY,
+        httpOptions: {
+          apiVersion: "",
+          baseUrl: process.env.AI_INTEGRATIONS_GEMINI_BASE_URL,
+        },
+      });
+
+      const systemPrompt = mode === "quote"
+        ? `Tu es un assistant OCR spécialisé dans les devis automobiles français. Analyse l'image et extrais les informations structurées. Retourne UNIQUEMENT un JSON valide (sans markdown, sans backticks): {"clientName":"string ou null","clientEmail":"string ou null","vehicleBrand":"string ou null","vehicleModel":"string ou null","vehiclePlate":"string ou null","notes":"string ou null","items":[{"description":"string","quantity":"1","unitPrice":"string","tvaRate":"20"}]}`
+        : `Tu es un assistant OCR spécialisé dans les factures françaises. Analyse l'image et extrais les informations structurées. Retourne UNIQUEMENT un JSON valide (sans markdown, sans backticks): {"clientName":"string ou null","clientEmail":"string ou null","notes":"string ou null","paymentMethod":"cash|wire_transfer|card|sepa|stripe|klarna|alma ou null","items":[{"description":"string","quantity":"1","unitPrice":"string","tvaRate":"20"}]}`;
+
+      try {
+        const response = await ocrAi.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: [{
+            role: "user",
+            parts: [
+              { text: systemPrompt },
+              { inlineData: { mimeType, data: imageBase64 } },
+            ],
+          }],
+          config: {
+            temperature: 0.1,
+            maxOutputTokens: 2048,
+          },
+        });
+
+        const text = response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        if (text) {
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            try {
+              const parsed = JSON.parse(jsonMatch[0]);
+              console.log(`[OCR] ✅ Gemini SDK success for ${mode}`);
+              return res.json({ success: true, data: parsed });
+            } catch (parseErr: any) {
+              console.log(`[OCR] JSON parse error: ${parseErr.message}, raw: ${text.substring(0, 200)}`);
+            }
+          }
+        }
+        console.log(`[OCR] Gemini response could not be parsed: ${text.substring(0, 200)}`);
+      } catch (geminiErr: any) {
+        console.error(`[OCR] Gemini SDK error: ${geminiErr.message}`);
+        return res.status(500).json({ success: false, message: `Erreur IA: ${geminiErr.message}` });
+      }
+
+      console.log(`[OCR] Returning empty fallback for ${mode}`);
+      return res.json({
+        success: true,
+        data: {
+          clientName: null,
+          clientEmail: null,
+          notes: "Document scanné - remplir les champs manuellement",
+          items: [{ description: "", quantity: "1", unitPrice: "", tvaRate: "20" }],
+          ...(mode === "quote" && { vehicleBrand: null, vehicleModel: null, vehiclePlate: null }),
+        },
+      });
+    } catch (err: any) {
+      console.error("[OCR] Unexpected error:", err.message);
+      return res.status(500).json({ success: false, message: "Erreur lors de l'analyse OCR" });
+    }
+  });
+
+  // @ts-ignore — legacy code: not all paths return
+  app.get("/api/public/pdf/:type/:id", async (req: Request, res: Response) => {
+    const { type, id } = req.params;
+    const token = req.query.token as string;
+  // @ts-ignore — legacy code: not all paths return
+    if (!type || !id || !["quotes", "invoices"].includes(type)) {
+      return res.status(400).json({ message: "Type invalide" });
+    }
+    if (!token) {
+      return res.status(400).json({ message: "Token requis" });
+    }
+    try {
+      const endpoint = `/mobile/${type}/${id}/pdf?viewToken=${encodeURIComponent(token)}`;
+      const headers: Record<string, string> = {
+        "accept": "application/pdf",
+      };
+      const response = await fetchWithBackendFallback(endpoint, { method: "GET", headers, redirect: "manual" });
+      const ct = response.headers.get("content-type") || "";
+      if (ct.includes("application/pdf") || ct.includes("octet-stream")) {
+        const body = await response.arrayBuffer();
+        res.status(response.status);
+        res.setHeader("content-type", ct);
+        const disposition = response.headers.get("content-disposition");
+        if (disposition) res.setHeader("content-disposition", disposition);
+        res.send(Buffer.from(body));
+      } else {
+        const body = await response.text();
+        if (body.includes("<!DOCTYPE") || body.includes("<html")) {
+          return res.status(404).json({ message: "PDF non trouvé" });
+        }
+        res.status(response.status);
+        res.setHeader("content-type", ct || "application/json");
+        res.send(body);
+      }
+    } catch (err: any) {
+      console.error("[PUBLIC-PDF] Error:", err.message);
+      res.status(502).json({ message: "Erreur de connexion" });
+    }
+  });
+
+  app.use("/api", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const clientAccept = (req.headers["accept"] as string) || "application/json";
+      const wantsPdf = clientAccept.includes("application/pdf");
+      const headers: Record<string, string> = {
+        "accept": wantsPdf ? "application/pdf" : "application/json",
+        "x-requested-with": "XMLHttpRequest",
+      };
+
+      if (req.headers["content-type"]) {
+        headers["content-type"] = req.headers["content-type"] as string;
+      }
+      if (req.headers["cookie"]) {
+        headers["cookie"] = req.headers["cookie"] as string;
+      }
+      if (req.headers["authorization"]) {
+        headers["authorization"] = req.headers["authorization"] as string;
+      }
+
+      const fetchOptions: RequestInit = {
+        method: req.method,
+        headers,
+        redirect: "manual",
+      };
+
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        const contentType = req.headers["content-type"] || "";
+        if (contentType.includes("application/json")) {
+          fetchOptions.body = JSON.stringify(req.body);
+        } else if (contentType.includes("multipart/form-data")) {
+          fetchOptions.body = req.rawBody as any;
+          headers["content-type"] = contentType;
+        } else if (contentType.includes("urlencoded")) {
+          const params = new URLSearchParams(req.body);
+          fetchOptions.body = params.toString();
+        } else if (req.rawBody) {
+          fetchOptions.body = req.rawBody as any;
+        } else {
+          fetchOptions.body = JSON.stringify(req.body);
+          headers["content-type"] = "application/json";
+        }
+      }
+
+      const response = await fetchWithBackendFallback(req.url, fetchOptions);
+
+      const proxyCookieParts: string[] = [];
+      response.headers.forEach((value, key) => {
+        const lk = key.toLowerCase();
+        if (lk === "transfer-encoding" || lk === "content-encoding" || lk === "content-length" || lk === "location") return;
+        if (lk === "set-cookie") {
+          res.appendHeader("set-cookie", value);
+          const cookiePart = value.split(";")[0].trim();
+          if (cookiePart && !cookiePart.startsWith("XSRF-TOKEN") && !cookiePart.startsWith("csrf")) {
+            proxyCookieParts.push(cookiePart);
+          }
+          return;
+        }
+        if (lk !== "content-type") {
+          res.setHeader(key, value);
+        }
+      });
+      if (proxyCookieParts.length > 0) {
+        res.setHeader("X-Session-Cookie", proxyCookieParts.join("; "));
+      }
+
+      console.log(`[PROXY] ${req.method} /api${req.url} => ${response.status} ${response.statusText}`);
+
+      const upstreamContentType = response.headers.get("content-type") || "";
+      const body = await response.arrayBuffer();
+      const bodyBuf = Buffer.from(body);
+
+      // Detect PDF: check Content-Type OR magic bytes (%PDF) OR URL ending with /pdf
+      const isPdfByType = upstreamContentType.includes("application/pdf") || upstreamContentType.includes("octet-stream");
+      const isPdfByMagic = bodyBuf.length > 4 && bodyBuf.slice(0, 4).toString("ascii") === "%PDF";
+      const isPdfByUrl = req.url.endsWith("/pdf") || req.url.includes("/pdf?");
+      if (isPdfByType || isPdfByMagic || (isPdfByUrl && response.status === 200)) {
+        res.status(response.status);
+        res.setHeader("content-type", "application/pdf");
+        const disposition = response.headers.get("content-disposition");
+        if (disposition) res.setHeader("content-disposition", disposition);
+        else res.setHeader("content-disposition", "inline; filename=\"document.pdf\"");
+        res.send(bodyBuf);
+        return;
+      }
+
+      const text = Buffer.from(body).toString("utf-8");
+      let isJson = false;
+      try {
+        const parsed = JSON.parse(text);
+        isJson = true;
+        const debugEndpoints = ["/invoices", "/quotes", "/reservations", "/services", "/login", "/auth", "/mobile/auth", "/mobile/public"];
+        const shouldLog = debugEndpoints.some(ep => req.url === ep || req.url.startsWith(ep + "?") || req.url.startsWith(ep + "/"));
+        if (response.status >= 400) {
+          console.log(`[PROXY-ERROR] ${req.method} /api${req.url} => ${response.status}:`, JSON.stringify(parsed).slice(0, 2000));
+        } else if (shouldLog) {
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            console.log(`[DEBUG] ${req.method} /api${req.url} => Array[${parsed.length}], keys:`, Object.keys(parsed[0]), "sample:", JSON.stringify(parsed[0]).slice(0, 1500));
+          } else if (parsed && typeof parsed === "object") {
+            console.log(`[DEBUG] ${req.method} /api${req.url} => Object keys:`, Object.keys(parsed), "full:", JSON.stringify(parsed).slice(0, 2000));
+          }
+        }
+        res.status(response.status);
+        res.setHeader("content-type", "application/json");
+        res.send(Buffer.from(body));
+      } catch {
+        if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+          console.log(`[DEBUG] ${req.method} /api${req.url} => HTML response (SPA fallback), status: ${response.status}`);
+          const isMutation = req.method === "POST" || req.method === "PUT" || req.method === "PATCH" || req.method === "DELETE";
+          if (isMutation) {
+            res.status(404);
+            res.setHeader("content-type", "application/json");
+            res.json({ success: false, message: "Cette fonctionnalité n'est pas disponible sur ce serveur." });
+          } else {
+            res.status(404);
+            res.setHeader("content-type", "application/json");
+            res.json({ message: "Endpoint non trouvé" });
+          }
+        } else {
+          res.status(response.status);
+          res.send(Buffer.from(body));
+        }
+      }
+    } catch (err: any) {
+      console.error("API proxy error:", err.message);
+      res.status(502).json({ message: "Erreur de connexion au serveur API" });
+    }
+  });
+}

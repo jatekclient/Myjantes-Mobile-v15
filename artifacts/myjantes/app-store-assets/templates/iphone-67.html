@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1290">
+<title>MyTools Admin — iPhone 6.7" Screenshots</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Michroma&family=Inter:wght@400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #1a1a1a;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 40px;
+    padding: 40px;
+    font-family: 'Inter', sans-serif;
+  }
+
+  .slide {
+    width: 1290px;
+    height: 2796px;
+    background: #0A0A0A;
+    position: relative;
+    overflow: hidden;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    page-break-after: always;
+  }
+
+  .glow {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: radial-gradient(ellipse 900px 700px at 50% 30%, rgba(220,38,38,0.18) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .grid-overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 80px 80px;
+    pointer-events: none;
+  }
+
+  .top-label {
+    position: absolute;
+    top: 120px;
+    left: 0; right: 0;
+    text-align: center;
+    z-index: 10;
+  }
+
+  .app-name {
+    font-family: 'Michroma', sans-serif;
+    font-size: 52px;
+    color: #F0F0F0;
+    letter-spacing: 12px;
+    text-transform: uppercase;
+  }
+
+  .app-tagline {
+    font-family: 'Inter', sans-serif;
+    font-size: 24px;
+    color: #666666;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    margin-top: 16px;
+  }
+
+  .phone-frame {
+    width: 820px;
+    height: 1680px;
+    background: #161616;
+    border-radius: 68px;
+    border: 3px solid #2A2A2A;
+    position: relative;
+    overflow: hidden;
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.05),
+      0 60px 200px rgba(0,0,0,0.8),
+      0 0 100px rgba(220,38,38,0.1);
+    z-index: 5;
+    margin-top: 0px;
+  }
+
+  .phone-notch {
+    position: absolute;
+    top: 0; left: 50%; transform: translateX(-50%);
+    width: 240px; height: 40px;
+    background: #0A0A0A;
+    border-radius: 0 0 28px 28px;
+    z-index: 20;
+  }
+
+  .phone-screen {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: #0A0A0A;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* === SCREEN 1: DASHBOARD === */
+  .dashboard-header {
+    padding: 70px 40px 30px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .logo-circle {
+    width: 70px; height: 70px;
+    background: #DC2626;
+    border-radius: 20px;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .logo-inner {
+    width: 40px; height: 40px;
+    background: white;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Michroma', sans-serif;
+    font-size: 14px;
+    color: #DC2626;
+    font-weight: bold;
+  }
+
+  .header-text { flex: 1; }
+  .greeting { font-size: 24px; color: #666; font-family: 'Inter', sans-serif; }
+  .username { font-size: 44px; font-weight: 700; color: #F0F0F0; font-family: 'Inter', sans-serif; }
+
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 0 40px 30px;
+  }
+
+  .kpi-card {
+    background: #161616;
+    border-radius: 24px;
+    border: 1px solid #2A2A2A;
+    padding: 30px 24px;
+  }
+
+  .kpi-label {
+    font-size: 20px;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-family: 'Inter', sans-serif;
+  }
+
+  .kpi-value {
+    font-size: 48px;
+    font-weight: 700;
+    color: #F0F0F0;
+    margin-top: 8px;
+    font-family: 'Inter', sans-serif;
+  }
+
+  .kpi-red { color: #EF4444; }
+  .kpi-green { color: #22C55E; }
+
+  .chart-section {
+    padding: 0 40px;
+  }
+
+  .section-label {
+    font-size: 18px;
+    font-weight: 600;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-bottom: 20px;
+    font-family: 'Inter', sans-serif;
+  }
+
+  .chart {
+    height: 220px;
+    background: #161616;
+    border-radius: 24px;
+    border: 1px solid #2A2A2A;
+    display: flex;
+    align-items: flex-end;
+    padding: 30px 20px;
+    gap: 16px;
+  }
+
+  .bar {
+    flex: 1;
+    background: linear-gradient(180deg, #DC2626 0%, rgba(220,38,38,0.3) 100%);
+    border-radius: 8px 8px 0 0;
+  }
+
+  .tab-bar {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 140px;
+    background: #111111;
+    border-top: 1px solid #2A2A2A;
+    display: flex;
+    align-items: center;
+    justify-content: space-around;
+    padding: 0 20px;
+    padding-bottom: 30px;
+  }
+
+  .tab-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tab-icon {
+    width: 48px; height: 48px;
+    background: #DC2626;
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+  }
+
+  .tab-icon-inactive {
+    width: 48px; height: 48px;
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+    color: #444;
+  }
+
+  .tab-label { font-size: 16px; color: #DC2626; font-family: 'Inter', sans-serif; font-weight: 500; }
+  .tab-label-inactive { font-size: 16px; color: #444; font-family: 'Inter', sans-serif; }
+
+  /* Bottom caption */
+  .bottom-caption {
+    position: absolute;
+    bottom: 120px;
+    left: 0; right: 0;
+    text-align: center;
+    z-index: 10;
+  }
+
+  .caption-title {
+    font-size: 72px;
+    font-weight: 700;
+    color: #F0F0F0;
+    font-family: 'Inter', sans-serif;
+    line-height: 1.1;
+  }
+
+  .caption-sub {
+    font-size: 36px;
+    color: #666;
+    font-family: 'Inter', sans-serif;
+    margin-top: 16px;
+  }
+
+  .red-line {
+    width: 120px; height: 6px;
+    background: #DC2626;
+    border-radius: 3px;
+    margin: 24px auto;
+  }
+</style>
+</head>
+<body>
+
+<!-- SCREENSHOT 1: DASHBOARD -->
+<div class="slide">
+  <div class="glow"></div>
+  <div class="grid-overlay"></div>
+
+  <div class="top-label">
+    <div class="app-name">MYTOOLS</div>
+    <div class="app-tagline">Built for Performance</div>
+  </div>
+
+  <div class="phone-frame" style="margin-top: -80px">
+    <div class="phone-notch"></div>
+    <div class="phone-screen">
+      <div class="dashboard-header">
+        <div class="logo-circle"><div class="logo-inner">MT</div></div>
+        <div class="header-text">
+          <div class="greeting">Bonjour,</div>
+          <div class="username">Admin</div>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">CA Mois</div>
+          <div class="kpi-value kpi-green">12 840 €</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">En attente</div>
+          <div class="kpi-value kpi-red">3 200 €</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Clients</div>
+          <div class="kpi-value">247</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Rendez-vous</div>
+          <div class="kpi-value">18</div>
+        </div>
+      </div>
+
+      <div class="chart-section">
+        <div class="section-label">6 derniers mois</div>
+        <div class="chart">
+          <div class="bar" style="height:40%"></div>
+          <div class="bar" style="height:65%"></div>
+          <div class="bar" style="height:50%"></div>
+          <div class="bar" style="height:80%"></div>
+          <div class="bar" style="height:70%"></div>
+          <div class="bar" style="height:100%"></div>
+        </div>
+      </div>
+
+      <div class="tab-bar">
+        <div class="tab-item">
+          <div class="tab-icon">📊</div>
+          <div class="tab-label">Dashboard</div>
+        </div>
+        <div class="tab-item">
+          <div class="tab-icon-inactive">📄</div>
+          <div class="tab-label-inactive">Devis</div>
+        </div>
+        <div class="tab-item">
+          <div class="tab-icon-inactive">🧾</div>
+          <div class="tab-label-inactive">Factures</div>
+        </div>
+        <div class="tab-item">
+          <div class="tab-icon-inactive">📅</div>
+          <div class="tab-label-inactive">RDV</div>
+        </div>
+        <div class="tab-item">
+          <div class="tab-icon-inactive">👥</div>
+          <div class="tab-label-inactive">Clients</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom-caption">
+    <div class="caption-title">Tableau de bord<br>en temps réel</div>
+    <div class="red-line"></div>
+    <div class="caption-sub">Chiffre d'affaires, KPIs et tendances</div>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "MyJantes"
+description = "MyJantes est l'application mobile de la plateforme MyJantes pour la gestion de devis, factures, rendez-vous et demandes de service liés aux jantes automobiles. Destinée aux clients particuliers et professionnels du secteur auto."
+version = "1.0.0"
+id = "artifacts/myjantes"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 23453
+
+[services.development]
+run = "pnpm --filter @workspace/myjantes run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/myjantes", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/myjantes", "run", "serve" ]
+
+[services.env]
+PORT = "23453"
+BASE_PATH = "/"

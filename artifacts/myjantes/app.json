@@ -1,0 +1,102 @@
+{
+  "expo": {
+    "name": "MyJantes",
+    "slug": "myjantes",
+    "version": "2.15.8",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "myjantes",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0A0A"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.mytoolsmobile.mytoolsgroup.eu",
+      "buildNumber": "85",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSCameraUsageDescription": "MyJantes utilise l’appareil photo pour photographier vos jantes lors de vos demandes de devis et de l’essai virtuel.",
+        "NSPhotoLibraryUsageDescription": "MyJantes accède à votre galerie pour joindre des photos de jantes à vos demandes.",
+        "NSPhotoLibraryAddUsageDescription": "MyJantes peut enregistrer vos rendus d’essai virtuel dans votre photothèque.",
+        "NSCalendarsUsageDescription": "MyJantes peut ajouter vos rendez-vous à votre calendrier.",
+        "NSFaceIDUsageDescription": "MyJantes utilise Face ID pour sécuriser l’accès à votre compte client.",
+        "NSMicrophoneUsageDescription": "MyJantes utilise le microphone uniquement si vous ajoutez une vidéo à une demande.",
+        "ITSAppUsesNonExemptEncryption": "NO",
+        "NSUserNotificationsUsageDescription": "MyJantes vous envoie des notifications pour les mises à jour de devis, factures et rendez-vous."
+      }
+    },
+    "android": {
+      "package": "app.mytoolsmobile.mytoolsgroup.eu",
+      "versionCode": 85,
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0A0A",
+        "foregroundImage": "./assets/images/icon.png"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "./plugins/withPrivacyManifest",
+      "expo-web-browser",
+      "expo-secure-store",
+      "expo-apple-authentication",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/icon.png",
+          "color": "#DC2626",
+          "sounds": []
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "MyJantes utilise l’appareil photo pour photographier vos jantes.",
+          "microphonePermission": "MyJantes utilise le microphone pour les vidéos ajoutées à vos demandes.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "MyJantes accède à votre galerie pour joindre des photos à vos demandes."
+        }
+      ],
+      "expo-asset",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "MyJantes utilise Face ID pour sécuriser l’accès à votre compte client."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "184bb31c-8fb0-42ce-b71f-8408a91225b3"
+      },
+      "router": {}
+    },
+    "owner": "mytoolsapps"
+  }
+}

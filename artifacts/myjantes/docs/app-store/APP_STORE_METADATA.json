@@ -1,0 +1,114 @@
+{
+  "app": {
+    "name": "MyTools Admin",
+    "subtitle": "Gestion de garage simplifiée",
+    "bundleId": "eu.mytoolsgroup.mytools-admin",
+    "androidPackage": "eu.mytoolsgroup.mytoolsadmin",
+    "version": "1.0.0",
+    "buildNumber": "1",
+    "ageRating": "4+",
+    "category": "Business",
+    "subCategory": "Productivity",
+    "primaryLanguage": "fr-FR"
+  },
+  "store": {
+    "ios": {
+      "appName": "MyTools Admin",
+      "subtitle": "Gestion de garage simplifiée",
+      "promotionalText": "Gérez vos devis, factures, réservations et clients depuis votre smartphone. MyTools Admin, l'outil indispensable des garages partenaires MyTools.",
+      "keywords": [
+        "garage",
+        "gestion",
+        "devis",
+        "factures",
+        "réservations",
+        "clients",
+        "admin",
+        "mytools",
+        "atelier",
+        "automobile",
+        "mécanique",
+        "pro"
+      ],
+      "supportUrl": "https://www.mytoolsgroup.eu/support",
+      "marketingUrl": "https://www.mytoolsgroup.eu",
+      "privacyPolicyUrl": "https://www.mytoolsgroup.eu/privacy"
+    },
+    "android": {
+      "shortDescription": "MyTools admin app for garage management — quotes, invoices, clients.",
+      "privacyPolicyUrl": "https://www.mytoolsgroup.eu/privacy"
+    }
+  },
+  "permissions": {
+    "ios": [
+      {
+        "key": "NSCameraUsageDescription",
+        "value": "MyTools Admin uses the camera to take photos of vehicles and parts to attach to quotes."
+      },
+      {
+        "key": "NSPhotoLibraryUsageDescription",
+        "value": "MyTools Admin accesses your photo library to let you attach existing photos to quotes."
+      },
+      {
+        "key": "NSPhotoLibraryAddUsageDescription",
+        "value": "MyTools Admin saves photos related to quotes to your photo library."
+      }
+    ],
+    "android": [
+      {
+        "permission": "android.permission.INTERNET",
+        "reason": "Required to connect to the MyTools Group backend API"
+      },
+      {
+        "permission": "android.permission.CAMERA",
+        "reason": "Take photos of vehicles and parts to attach to quotes"
+      },
+      {
+        "permission": "android.permission.READ_MEDIA_IMAGES",
+        "reason": "Select existing photos from your gallery to attach to quotes (Android 13+)"
+      },
+      {
+        "permission": "android.permission.READ_EXTERNAL_STORAGE",
+        "reason": "Select existing photos from your gallery to attach to quotes (Android 12 and below)"
+      }
+    ]
+  },
+  "screenshots": {
+    "iphone67": {
+      "dimensions": "1290x2796",
+      "count": 5,
+      "captions": [
+        "Tableau de bord en temps réel",
+        "Gérez vos devis facilement",
+        "Suivi complet des factures",
+        "Rendez-vous & réservations",
+        "Base clients complète"
+      ]
+    },
+    "iphone65": {
+      "dimensions": "1242x2688",
+      "count": 5
+    },
+    "iphone55": {
+      "dimensions": "1242x2208",
+      "count": 5
+    }
+  },
+  "branding": {
+    "primaryColor": "#DC2626",
+    "secondaryColor": "#0A0A0A",
+    "accentColor": "#EF4444",
+    "backgroundColor": "#F6F6F8",
+    "fontTitle": "Michroma",
+    "fontBody": "Inter",
+    "logoFile": "assets/images/logo_new.png",
+    "iconFile": "assets/images/icon.png",
+    "splashFile": "assets/images/splash-icon.png"
+  },
+  "contact": {
+    "email": "contact@mytoolsgroup.eu",
+    "website": "https://www.mytoolsgroup.eu",
+    "support": "https://www.mytoolsgroup.eu/support",
+    "privacy": "https://www.mytoolsgroup.eu/privacy"
+  }
+}

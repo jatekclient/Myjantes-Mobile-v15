@@ -1,0 +1,201 @@
+OBJECTIF :
+Corriger définitivement l’affichage des lignes (services/items) dans :
+
+1. Écran de modification (EditInvoice / EditQuote)
+2. Écran d’aperçu (Preview)
+3. Génération PDF
+
+---
+
+PROBLÈME ACTUEL :
+
+- Les lignes existent (total correct)
+- MAIS :
+  ❌ non affichées en modification
+  ❌ non affichées en aperçu
+  ❌ absentes du PDF
+
+=> problème de mapping / source de données incohérente
+
+---
+
+RÈGLES STRICTES :
+
+❌ NE PAS modifier backend  
+❌ NE PAS refactor global  
+✔ Corriger uniquement la source des lignes et son utilisation  
+
+---
+
+## ÉTAPE 1 — IDENTIFIER SOURCE UNIQUE DES LIGNES
+
+Créer une fonction commune :
+
+/utils/lines.js
+
+export const getLines = (data) => {
+  if (!data) return []
+
+  return (
+    data.lines ||
+    data.items ||
+    data.services ||
+    []
+  )
+}
+
+---
+
+## ÉTAPE 2 — CORRIGER ÉCRAN MODIFICATION
+
+Dans EditInvoice / EditQuote :
+
+const [lines, setLines] = useState([])
+
+useEffect(() => {
+  if (invoiceFromApi) {
+    setLines(getLines(invoiceFromApi))
+  }
+}, [invoiceFromApi])
+
+---
+
+IMPORTANT :
+
+❌ ne plus utiliser invoice.lines directement  
+✔ utiliser UNIQUEMENT lines
+
+---
+
+RENDER :
+
+data={lines}
+
+---
+
+## ÉTAPE 3 — SYNCHRONISER LINES AVEC DATA PRINCIPALE
+
+Avant sauvegarde :
+
+const payload = {
+  ...invoice,
+  lines: lines
+}
+
+IMPORTANT :
+- Toujours envoyer lines
+- Ne pas envoyer items ou services séparément
+
+---
+
+## ÉTAPE 4 — CORRIGER APERÇU (PREVIEW)
+
+Dans écran Preview :
+
+❌ data={invoice.lines}
+❌ data={invoice.items}
+
+✔ data={getLines(invoice)}
+
+---
+
+RENDER :
+
+{getLines(invoice).map((item, index) => (
+  <View key={index}>
+    <Text>{item.description || item.name}</Text>
+    <Text>{item.quantity || 1}</Text>
+    <Text>{item.price || item.unit_price}</Text>
+  </View>
+))}
+
+---
+
+## ÉTAPE 5 — CORRIGER GÉNÉRATION PDF
+
+Trouver fonction PDF (ex: generateInvoicePdf)
+
+REMPLACER :
+
+❌ invoice.lines
+❌ invoice.items
+
+PAR :
+
+✔ const lines = getLines(invoice)
+
+---
+
+PUIS :
+
+lines.map(line => {
+  // génération contenu PDF
+})
+
+---
+
+IMPORTANT :
+
+- Vérifier que chaque ligne contient :
+  description / name
+  price / unit_price
+  quantity
+
+---
+
+## ÉTAPE 6 — NORMALISATION DES CHAMPS
+
+Créer helper :
+
+const normalizeLine = (item) => ({
+  description: item.description || item.name || "",
+  price: item.price || item.unit_price || 0,
+  quantity: item.quantity || item.qty || 1
+})
+
+---
+
+Utiliser partout :
+
+getLines(data).map(normalizeLine)
+
+---
+
+## ÉTAPE 7 — SÉCURITÉ AFFICHAGE
+
+Si aucune ligne :
+
+{lines.length === 0 && (
+  <Text>Aucune ligne</Text>
+)}
+
+---
+
+## ÉTAPE 8 — TESTS OBLIGATOIRES
+
+1. Modifier facture
+✔ lignes visibles
+
+2. Aperçu facture
+✔ mêmes lignes affichées
+
+3. Générer PDF
+✔ lignes présentes
+
+4. Devis
+✔ même comportement
+
+---
+
+RÉSULTAT ATTENDU :
+
+✔ Une seule source de vérité des lignes  
+✔ Affichage correct partout  
+✔ PDF cohérent avec UI  
+✔ Aucun bug restant  
+
+---
+
+PRIORITÉ :
+
+COHÉRENCE DES DONNÉES > REFACTOR

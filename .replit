@@ -1,0 +1,31 @@
+modules = ["nodejs-24", "python-base-3.13"]
+
+[deployment]
+router = "application"
+deploymentTarget = "autoscale"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[objectStorage]
+defaultBucketID = "replit-objstore-dea7e916-242a-4fdd-a511-de9fff2453ed"
+
+[userenv]
+
+[userenv.shared]
+EXPO_PUBLIC_EXTERNAL_API_URL = "https://api.myjantes.fr/api"
+EXPO_PUBLIC_PUBLIC_BASE_URL = "https://myjantes.fr"
+EXTERNAL_API_URL = "https://api.myjantes.fr/api"
+PUBLIC_BASE_URL = "https://myjantes.fr"
