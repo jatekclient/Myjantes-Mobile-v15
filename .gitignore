@@ -47,3 +47,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Local migration backup (may contain private environment files)
+.migration-backup/
