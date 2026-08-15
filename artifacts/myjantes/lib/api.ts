@@ -25,6 +25,16 @@ class TimeoutError extends Error {
   }
 }
 
+/** Typed API error that preserves the HTTP status code from the server response. */
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function fetchWithTimeout(
   url: string,
   options: any,
@@ -250,7 +260,8 @@ export async function apiCall<T = any>(
         reportUpstreamError(res.status, endpoint);
       } catch {}
     }
-    let errorMessage = `Erreur ${res.status}`;
+    const httpStatus = res.status;
+    let errorMessage = `Erreur ${httpStatus}`;
     try {
       const text = await res.text();
       try {
@@ -260,7 +271,9 @@ export async function apiCall<T = any>(
         if (text) errorMessage = text.substring(0, 200);
       }
     } catch {}
-    throw new Error(errorMessage);
+    // Throw ApiError (not plain Error) so callers can inspect the HTTP status reliably,
+    // regardless of what the server put in the error body.
+    throw new ApiError(errorMessage, httpStatus);
   }
 
   if (res.ok) {
@@ -751,16 +764,62 @@ export const chatApi = {
   getUsers: () => apiCall<any[]>("/api/mobile/chat/users"),
 };
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+/**
+ * Returns true when the error comes from a 404/405 HTTP response.
+ * Uses the ApiError.status property (set by apiCall) so the check is reliable
+ * even when the server returns a custom JSON error body without the number.
+ */
+function isEndpointMissing(err: any): boolean {
+  if (err instanceof ApiError) return err.status === 404 || err.status === 405;
+  // Fallback for errors from code paths that don't go through apiCall
+  const msg: string = err?.message || "";
+  return /\b(404|405)\b/.test(msg) || /not found|route not found/i.test(msg);
+}
+
 // ── Delivery Notes (Bons de livraison) ──────────────────────────────────────
 export const deliveryNotesApi = {
-  getAll: () => apiCall<any>("/api/mobile/bon-livraison"),
-  getById: (id: string) => apiCall<any>(`/api/mobile/bon-livraison/${id}`),
+  /** Returns { available: false } when the endpoint returns 404/405 so the UI
+   *  can show the graceful empty state instead of an error. */
+  getAll: async (): Promise<any> => {
+    try {
+      return await apiCall<any>("/api/mobile/bon-livraison");
+    } catch (err) {
+      if (isEndpointMissing(err)) return { available: false };
+      throw err;
+    }
+  },
+  getById: async (id: string): Promise<any> => {
+    try {
+      return await apiCall<any>(`/api/mobile/bon-livraison/${id}`);
+    } catch (err) {
+      if (isEndpointMissing(err)) return { available: false };
+      throw err;
+    }
+  },
 };
 
 // ── Account (solde, remise, interlocuteurs) ──────────────────────────────────
 export const accountApi = {
-  getSummary: () => apiCall<any>("/api/mobile/account/summary"),
-  getContacts: () => apiCall<any>("/api/mobile/account/contacts"),
+  /** Returns { available: false } on 404/405 so ProBalanceCard shows N/A gracefully. */
+  getSummary: async (): Promise<any> => {
+    try {
+      return await apiCall<any>("/api/mobile/account/summary");
+    } catch (err) {
+      if (isEndpointMissing(err)) return { available: false };
+      throw err;
+    }
+  },
+  /** Returns { available: false, contacts: [] } on 404/405 so the screen shows
+   *  "Interlocuteur non assigné" instead of "Données indisponibles". */
+  getContacts: async (): Promise<any> => {
+    try {
+      return await apiCall<any>("/api/mobile/account/contacts");
+    } catch (err) {
+      if (isEndpointMissing(err)) return { available: false, contacts: [] };
+      throw err;
+    }
+  },
 };
 
 // ── GCS Storage (presigned URL upload pour les photos devis) ─────────────────
@@ -828,12 +887,10 @@ export const supportApi = {
       });
       return result;
     } catch (primaryErr: any) {
-      // apiCall throws plain Error objects — check the message for HTTP status codes.
-      // "Erreur 404", "Erreur 405", or a custom 404/405 body message all warrant a fallback.
-      const msg: string = primaryErr?.message || "";
-      const isNotFound = /\b(404|405|not found|route not found|endpoint not found)\b/i.test(msg);
-      if (!isNotFound) throw primaryErr;
-      console.warn("[supportApi.contact] Primary endpoint failed (not found), trying chat fallback:", msg);
+      // Use ApiError.status when available (set by apiCall); fall back to message parsing
+      // for errors that don't originate from apiCall.
+      if (!isEndpointMissing(primaryErr)) throw primaryErr;
+      console.warn("[supportApi.contact] Primary endpoint not found, trying chat fallback:", primaryErr?.message);
     }
 
     // 2. Fallback: route through chat conversations

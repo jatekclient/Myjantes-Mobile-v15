@@ -66,8 +66,13 @@ export default function GroupedInvoiceScreen() {
       if (Platform.OS !== "web") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       showAlert({
         type: "error",
-        title: "Erreur",
-        message: "Impossible d'envoyer la demande. Vérifiez votre connexion et réessayez.",
+        title: "Envoi impossible",
+        message:
+          "Votre demande n'a pas pu être transmise automatiquement.\n\n" +
+          "Contactez directement votre équipe MyJantes :\n" +
+          "📞 03 21 40 80 53\n" +
+          "✉ contact@myjantes.fr\n\n" +
+          "Horaires : Lun – Ven 8h00 – 18h00",
         buttons: [{ text: "OK" }],
       });
     },
