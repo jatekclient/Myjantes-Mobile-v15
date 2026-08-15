@@ -191,9 +191,12 @@ export default function HomeScreen() {
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([refetchServices(), refetchQuotes(), refetchInvoices(), refetchReservations()]);
-    setRefreshing(false);
-  }, []);
+    try {
+      await Promise.allSettled([refetchServices(), refetchQuotes(), refetchInvoices(), refetchReservations()]);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refetchServices, refetchQuotes, refetchInvoices, refetchReservations]);
 
   const pendingQuotes = quotes.filter((q) => q.status === "pending" || q.status === "en_attente");
   const acceptedQuotes = quotes.filter((q) => q.status === "accepted" || q.status === "accepté");

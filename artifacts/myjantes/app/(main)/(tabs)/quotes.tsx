@@ -90,13 +90,13 @@ export default function QuotesScreen() {
   const styles = useMemo(() => getStyles(theme), [theme]);
   const [refreshing, setRefreshing] = useState(false);
 
-  const { data: quotesRaw, isLoading, refetch } = useQuery({
+  const { data: quotesRaw, isLoading, isError, refetch } = useQuery({
     queryKey: ["quotes"],
     queryFn: quotesApi.getAll,
     refetchInterval: 30000,
   });
 
-  const quotes = Array.isArray(quotesRaw) ? quotesRaw : [];
+  const quotes = (Array.isArray(quotesRaw) ? quotesRaw : []).filter((q) => q && (q.id || (q as any)._id));
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -126,14 +126,25 @@ export default function QuotesScreen() {
           showsVerticalScrollIndicator={false}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={theme.primary} />}
           ListEmptyComponent={
-            <View style={styles.empty}>
-              <Ionicons name="document-text-outline" size={48} color={theme.textTertiary} />
-              <Text style={styles.emptyTitle}>Aucun devis</Text>
-              <Text style={styles.emptyText}>Vous n'avez pas encore de demande de devis.</Text>
-              <Pressable style={styles.emptyCta} onPress={() => router.push("/(main)/new-quote")}>
-                <Text style={styles.emptyCtaText}>Demander un devis</Text>
-              </Pressable>
-            </View>
+            isError ? (
+              <View style={styles.empty}>
+                <Ionicons name="cloud-offline-outline" size={48} color={theme.textTertiary} />
+                <Text style={styles.emptyTitle}>Connexion impossible</Text>
+                <Text style={styles.emptyText}>Impossible de charger vos devis. Vérifiez votre connexion puis réessayez.</Text>
+                <Pressable style={styles.emptyCta} onPress={() => refetch()}>
+                  <Text style={styles.emptyCtaText}>Réessayer</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <View style={styles.empty}>
+                <Ionicons name="document-text-outline" size={48} color={theme.textTertiary} />
+                <Text style={styles.emptyTitle}>Aucun devis</Text>
+                <Text style={styles.emptyText}>Vous n'avez pas encore de demande de devis.</Text>
+                <Pressable style={styles.emptyCta} onPress={() => router.push("/(main)/new-quote")}>
+                  <Text style={styles.emptyCtaText}>Demander un devis</Text>
+                </Pressable>
+              </View>
+            )
           }
         />
       )}

@@ -94,14 +94,14 @@ export default function InvoicesScreen() {
   const styles = useMemo(() => getStyles(theme), [theme]);
   const [refreshing, setRefreshing] = useState(false);
 
-  const { data: invoicesRaw, isLoading, refetch } = useQuery({
+  const { data: invoicesRaw, isLoading, isError, refetch } = useQuery({
     queryKey: ["invoices"],
     queryFn: invoicesApi.getAll,
     retry: 1,
     refetchInterval: 60000,
   });
 
-  const invoices = Array.isArray(invoicesRaw) ? invoicesRaw : [];
+  const invoices = (Array.isArray(invoicesRaw) ? invoicesRaw : []).filter((i) => i && (i.id || (i as any)._id));
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -125,11 +125,22 @@ export default function InvoicesScreen() {
           showsVerticalScrollIndicator={false}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={theme.primary} />}
           ListEmptyComponent={
-            <View style={styles.empty}>
-              <Ionicons name="receipt-outline" size={48} color={theme.textTertiary} />
-              <Text style={styles.emptyTitle}>Aucune facture</Text>
-              <Text style={styles.emptyText}>Vos factures apparaîtront ici une fois vos devis acceptés et traités.</Text>
-            </View>
+            isError ? (
+              <View style={styles.empty}>
+                <Ionicons name="cloud-offline-outline" size={48} color={theme.textTertiary} />
+                <Text style={styles.emptyTitle}>Connexion impossible</Text>
+                <Text style={styles.emptyText}>Impossible de charger vos factures. Vérifiez votre connexion puis réessayez.</Text>
+                <Pressable style={styles.emptyRetry} onPress={() => refetch()}>
+                  <Text style={styles.emptyRetryText}>Réessayer</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <View style={styles.empty}>
+                <Ionicons name="receipt-outline" size={48} color={theme.textTertiary} />
+                <Text style={styles.emptyTitle}>Aucune facture</Text>
+                <Text style={styles.emptyText}>Vos factures apparaîtront ici une fois vos devis acceptés et traités.</Text>
+              </View>
+            )
           }
         />
       )}
@@ -181,6 +192,8 @@ const getStyles = (theme: ThemeColors) => StyleSheet.create({
   viewRow: { flexDirection: "row", alignItems: "center", gap: 4 },
   viewLink: { fontSize: 13, fontFamily: "Exo2_500Medium", color: theme.primary },
   empty: { alignItems: "center", paddingTop: 80, gap: 8 },
+  emptyRetry: { backgroundColor: theme.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12, marginTop: 12 },
+  emptyRetryText: { color: "#fff", fontSize: 14, fontFamily: "Exo2_600SemiBold" },
   emptyTitle: { fontSize: 18, fontFamily: "Exo2_600SemiBold", color: theme.text, marginTop: 8 },
   emptyText: { fontSize: 14, fontFamily: "Exo2_400Regular", color: theme.textSecondary, textAlign: "center", paddingHorizontal: 40 },
 });

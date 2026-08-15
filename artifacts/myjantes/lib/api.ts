@@ -111,6 +111,11 @@ export function setApiOnTokensRefreshed(cb: (access: string, refresh: string | n
   apiOnTokensRefreshed = cb;
 }
 
+/** Renouvellement de jeton exposé pour les téléchargements hors apiCall (PDF). */
+export async function refreshApiTokens(): Promise<boolean> {
+  return tryRefreshApiToken();
+}
+
 async function tryRefreshApiToken(): Promise<boolean> {
   if (!apiRefreshToken) return false;
   try {

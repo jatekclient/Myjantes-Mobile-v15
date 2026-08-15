@@ -123,8 +123,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       setAccessToken(savedAccess);
       setUser(current);
-    } catch {
-      await clearSession();
+    } catch (err: any) {
+      // Ne purger la session que si l'authentification est réellement invalide.
+      // Une panne réseau ou une indisponibilité temporaire du backend ne doit
+      // pas déconnecter l'utilisateur ni détruire son refresh token.
+      if (err?.status === 401 || err?.status === 403) {
+        await clearSession();
+      } else {
+        setAccessToken(savedAccess);
+      }
     }
   }, [clearSession]);
 

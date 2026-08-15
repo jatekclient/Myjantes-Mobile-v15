@@ -2,10 +2,31 @@ import { Platform, Alert } from "react-native";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import * as WebBrowser from "expo-web-browser";
-import { getApiAccessToken, getSessionCookie } from "./api";
+import { getApiAccessToken, getSessionCookie, refreshApiTokens } from "./api";
 import { getMobileApiUrl } from "./config";
 
 const getDIRECT_API = () => getMobileApiUrl();
+const PDF_TIMEOUT_MS = 30_000;
+
+function buildAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { Accept: "application/pdf" };
+  const token = getApiAccessToken();
+  const cookie = getSessionCookie();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  else if (cookie) headers["Cookie"] = cookie;
+  return headers;
+}
+
+/** fetch avec timeout — évite un bouton "Chargement…" bloqué indéfiniment. */
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PDF_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Build a public view URL for a PDF document if the server provides a viewToken.
@@ -26,17 +47,6 @@ export async function viewPdf(
   viewToken?: string | null,
 ): Promise<boolean> {
   try {
-    // ── Authenticated helpers ────────────────────────────────────────────────
-    const mobileToken = getApiAccessToken();
-    const cookie = getSessionCookie();
-
-    const authHeaders: Record<string, string> = { Accept: "application/pdf" };
-    if (mobileToken) {
-      authHeaders["Authorization"] = `Bearer ${mobileToken}`;
-    } else if (cookie) {
-      authHeaders["Cookie"] = cookie;
-    }
-
     // ── Public view URL (if server returned a viewToken) ─────────────────────
     if (viewToken) {
       const publicUrl = buildPublicPdfUrl(type, id, viewToken);
@@ -59,14 +69,27 @@ export async function viewPdf(
 
     if (Platform.OS === "web") {
       try {
-        const response = await fetch(directUrl, {
+        let response = await fetchWithTimeout(directUrl, {
           method: "GET",
-          headers: authHeaders,
+          headers: buildAuthHeaders(),
           credentials: "include",
         });
 
+        // Jeton expiré : tenter un renouvellement puis rejouer une seule fois.
+        if (response.status === 401 && (await refreshApiTokens())) {
+          response = await fetchWithTimeout(directUrl, {
+            method: "GET",
+            headers: buildAuthHeaders(),
+            credentials: "include",
+          });
+        }
+
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw new Error(
+            response.status === 401
+              ? "Session expirée. Veuillez vous reconnecter."
+              : `Le serveur a répondu ${response.status}. Réessayez plus tard.`
+          );
         }
 
         const blob = await response.blob();
@@ -90,10 +113,19 @@ export async function viewPdf(
       const safeFileName = fileName.replace(/[^a-z0-9._-]/gi, "_");
       const filePath = `${FileSystem.documentDirectory}${safeFileName}`;
 
-      const result = await FileSystem.downloadAsync(directUrl, filePath, { headers: authHeaders });
+      let result = await FileSystem.downloadAsync(directUrl, filePath, { headers: buildAuthHeaders() });
+
+      // Jeton expiré : renouveler puis retélécharger une seule fois.
+      if (result.status === 401 && (await refreshApiTokens())) {
+        result = await FileSystem.downloadAsync(directUrl, filePath, { headers: buildAuthHeaders() });
+      }
 
       if (result.status !== 200) {
-        throw new Error(`Erreur ${result.status}`);
+        throw new Error(
+          result.status === 401
+            ? "Session expirée. Veuillez vous reconnecter."
+            : `Le serveur a répondu ${result.status}. Réessayez plus tard.`
+        );
       }
 
       const fileInfo = await FileSystem.getInfoAsync(filePath);
