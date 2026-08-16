@@ -12,8 +12,16 @@ import { useTheme } from "@/lib/theme";
 import { ThemeColors } from "@/constants/theme";
 import { FloatingSupport } from "@/components/FloatingSupport";
 
-function formatDate(dateStr: string) {
+function safeTs(dateStr: string | null | undefined): number {
+  if (!dateStr) return 0;
+  const t = new Date(dateStr).getTime();
+  return isFinite(t) ? t : 0;
+}
+
+function formatDate(dateStr: string | null | undefined) {
+  if (!dateStr) return "";
   const date = new Date(dateStr);
+  if (!isFinite(date.getTime())) return "";
   const now = new Date();
   const diffDays = Math.floor((now.getTime() - date.getTime()) / 86400000);
   if (diffDays === 0) return date.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
@@ -69,15 +77,14 @@ export default function MessagesScreen() {
     refetchInterval: 15000,
   });
 
-  const conversations = Array.isArray(conversationsRaw)
-    ? [...conversationsRaw].sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime())
-    : [];
+  const conversations = (Array.isArray(conversationsRaw) ? conversationsRaw : [])
+    .filter((c) => c && (c.id || (c as any)._id))
+    .sort((a, b) => safeTs(b.lastMessageAt) - safeTs(a.lastMessageAt));
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await refetch();
-    setRefreshing(false);
-  }, []);
+    try { await refetch(); } finally { setRefreshing(false); }
+  }, [refetch]);
 
   return (
     <View style={styles.container}>

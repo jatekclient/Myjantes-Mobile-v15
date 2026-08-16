@@ -297,7 +297,7 @@ export async function apiCall<T = any>(
     const parsed = JSON.parse(text);
     return parsed as T;
   } catch {
-    return {} as T;
+    throw new ApiError("Réponse du serveur invalide. Veuillez réessayer.", 500);
   }
 }
 

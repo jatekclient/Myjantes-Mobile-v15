@@ -146,14 +146,10 @@ export default function QuoteDetailScreen() {
   }
 
   const statusInfo = getStatusInfo(quote.status, theme.isDark);
-  const date = new Date(quote.createdAt);
-  const formattedDate = date.toLocaleDateString("fr-FR", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const _d = quote.createdAt ? new Date(quote.createdAt) : null;
+  const formattedDate = (_d && isFinite(_d.getTime()))
+    ? _d.toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "—";
 
   const vehicleInfo = parseVehicleInfo((quote as any).vehicleInfo);
   const quoteItems = parseItems((quote as any).items || (quote as any).lignes || (quote as any).lines || (quote as any).prestations);
@@ -220,7 +216,8 @@ export default function QuoteDetailScreen() {
   // "pending" (en attente de réponse) ET "sent" (envoyé) sont tous deux valides.
   const canRespond = !finalStatuses.has(statusLower);
 
-  const existingReservation = (allReservations as any[]).find(
+  const _reservationList = Array.isArray(allReservations) ? (allReservations as any[]) : [];
+  const existingReservation = _reservationList.find(
     (r) => r.quoteId === id || r.quoteId === quote?.id
   );
   const hasExistingReservation = !!existingReservation;

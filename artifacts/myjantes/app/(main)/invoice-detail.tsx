@@ -110,13 +110,10 @@ export default function InvoiceDetailScreen() {
   }
 
   const statusInfo = getInvoiceStatusInfo(invoice.status, theme.isDark);
-  const createdDate = new Date(invoice.createdAt).toLocaleDateString("fr-FR", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const _cd = invoice.createdAt ? new Date(invoice.createdAt) : null;
+  const createdDate = (_cd && isFinite(_cd.getTime()))
+    ? _cd.toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "—";
 
   const inv_any = invoice as any;
   let rawItems = inv_any.items || inv_any.lineItems || inv_any.line_items || inv_any.lignes || inv_any.lines || inv_any.prestations || inv_any.invoiceLines || inv_any.invoice_lines || inv_any.details || inv_any.rows || inv_any.prestations_lignes || inv_any.items_details || inv_any.products || inv_any.entries || inv_any.services || null;

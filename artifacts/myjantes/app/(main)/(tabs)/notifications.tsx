@@ -35,9 +35,11 @@ function getTypeColor(type: Notification["type"]): string {
   }
 }
 
-function getRelativeDate(dateStr: string): string {
+function getRelativeDate(dateStr: string | null | undefined): string {
+  if (!dateStr) return "";
   const now = new Date();
   const date = new Date(dateStr);
+  if (!isFinite(date.getTime())) return "";
   const diffMs = now.getTime() - date.getTime();
   const diffMin = Math.floor(diffMs / 60000);
   const diffHours = Math.floor(diffMs / 3600000);
@@ -122,11 +124,18 @@ export default function NotificationsScreen() {
     } catch {}
   }, []);
 
-  const notifications = Array.isArray(notificationsRaw) ? notificationsRaw : [];
+  function safeTs(dateStr: string | null | undefined): number {
+    if (!dateStr) return 0;
+    const t = new Date(dateStr).getTime();
+    return isFinite(t) ? t : 0;
+  }
+
+  const notifications = (Array.isArray(notificationsRaw) ? notificationsRaw : [])
+    .filter((n: any) => n && (n.id || (n as any)._id));
 
   React.useEffect(() => {
     if (notifications.length > 0) {
-      const latest = [...notifications].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+      const latest = [...notifications].sort((a, b) => safeTs(b.createdAt) - safeTs(a.createdAt))[0];
       if (lastNotificationId && latest.id !== lastNotificationId && !latest.isRead) playNotificationSound();
       setLastNotificationId(latest.id);
     }
@@ -134,9 +143,8 @@ export default function NotificationsScreen() {
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await refetch();
-    setRefreshing(false);
-  }, []);
+    try { await refetch(); } finally { setRefreshing(false); }
+  }, [refetch]);
 
   const handleMarkAllRead = useCallback(async () => {
     try { await notificationsApi.markAllRead(); queryClient.invalidateQueries({ queryKey: ["notifications"] }); } catch {}
@@ -149,7 +157,7 @@ export default function NotificationsScreen() {
     navigateToDetail(notification.type, notification.relatedId);
   }, []);
 
-  const sorted = [...notifications].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const sorted = [...notifications].sort((a, b) => safeTs(b.createdAt) - safeTs(a.createdAt));
   const hasUnread = notifications.some((n) => !n.isRead);
 
   return (

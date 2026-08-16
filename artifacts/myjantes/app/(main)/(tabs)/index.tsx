@@ -198,8 +198,8 @@ export default function HomeScreen() {
     }
   }, [refetchServices, refetchQuotes, refetchInvoices, refetchReservations]);
 
-  const pendingQuotes = quotes.filter((q) => q.status === "pending" || q.status === "en_attente");
-  const acceptedQuotes = quotes.filter((q) => q.status === "accepted" || q.status === "accepté");
+  const pendingQuotes = quotes.filter((q) => q && (q.status === "pending" || q.status === "en_attente"));
+  const acceptedQuotes = quotes.filter((q) => q && (q.status === "accepted" || q.status === "accepté"));
   const unpaidInvoices = invoices.filter((i) => {
     const s = i.status?.toLowerCase();
     return s === "pending" || s === "en_attente" || s === "sent" || s === "envoyée" || s === "overdue" || s === "en_retard";

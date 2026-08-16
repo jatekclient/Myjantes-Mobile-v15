@@ -106,38 +106,46 @@ export default function NewQuoteScreen() {
 
   const pickImages = async () => {
     if (photos.length >= MAX_PHOTOS) return;
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== "granted") {
-      showAlert({ type: "warning", title: "Permission requise", message: "Veuillez autoriser l'accès à votre galerie.", buttons: [{ text: "OK", style: "primary" }] });
-      return;
-    }
-    const remaining = MAX_PHOTOS - photos.length;
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsMultipleSelection: remaining > 1,
-      quality: 0.7,
-      selectionLimit: remaining,
-    });
-    if (!result.canceled && result.assets.length > 0) {
-      const newPhotos: UploadedPhoto[] = result.assets.map((asset) => ({
-        uri: asset.uri,
-        key: `local_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      }));
-      setPhotos((prev) => [...prev, ...newPhotos].slice(0, MAX_PHOTOS));
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== "granted") {
+        showAlert({ type: "warning", title: "Permission requise", message: "Veuillez autoriser l'accès à votre galerie.", buttons: [{ text: "OK", style: "primary" }] });
+        return;
+      }
+      const remaining = MAX_PHOTOS - photos.length;
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsMultipleSelection: remaining > 1,
+        quality: 0.7,
+        selectionLimit: remaining,
+      });
+      if (!result.canceled && result.assets.length > 0) {
+        const newPhotos: UploadedPhoto[] = result.assets.map((asset) => ({
+          uri: asset.uri,
+          key: `local_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        }));
+        setPhotos((prev) => [...prev, ...newPhotos].slice(0, MAX_PHOTOS));
+      }
+    } catch {
+      showAlert({ type: "error", title: "Erreur", message: "Impossible d'accéder à la galerie. Réessayez.", buttons: [{ text: "OK", style: "primary" }] });
     }
   };
 
   const takePhoto = async () => {
     if (photos.length >= MAX_PHOTOS) return;
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== "granted") {
-      showAlert({ type: "warning", title: "Permission requise", message: "Veuillez autoriser l'accès à la caméra.", buttons: [{ text: "OK", style: "primary" }] });
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 0.7 });
-    if (!result.canceled && result.assets.length > 0) {
-      const photo: UploadedPhoto = { uri: result.assets[0].uri, key: `local_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` };
-      setPhotos((prev) => [...prev, photo].slice(0, MAX_PHOTOS));
+    try {
+      const { status } = await ImagePicker.requestCameraPermissionsAsync();
+      if (status !== "granted") {
+        showAlert({ type: "warning", title: "Permission requise", message: "Veuillez autoriser l'accès à la caméra.", buttons: [{ text: "OK", style: "primary" }] });
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 0.7 });
+      if (!result.canceled && result.assets.length > 0) {
+        const photo: UploadedPhoto = { uri: result.assets[0].uri, key: `local_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` };
+        setPhotos((prev) => [...prev, photo].slice(0, MAX_PHOTOS));
+      }
+    } catch {
+      showAlert({ type: "error", title: "Erreur", message: "Impossible d'accéder à la caméra. Réessayez.", buttons: [{ text: "OK", style: "primary" }] });
     }
   };
 
@@ -188,7 +196,9 @@ export default function NewQuoteScreen() {
           // Browser FormData needs a Blob; native Expo uses the File object
           // below so the local URI is uploaded without a second storage hop.
           const response = await globalThis.fetch(photo.uri);
+          if (!response.ok) throw new Error(`Impossible de lire la photo (${response.status}).`);
           const blob = await response.blob();
+          if (!blob || blob.size === 0) throw new Error("Photo invalide ou vide.");
           formData.append("images", blob, fileName);
         } else {
           const file = new File(photo.uri);
@@ -219,8 +229,9 @@ export default function NewQuoteScreen() {
         message: "Votre demande de devis a été transmise. Nous vous recontacterons rapidement.",
         buttons: [{ text: "Voir mes demandes", onPress: () => router.push("/(main)/(tabs)/quotes"), style: "primary" }],
       });
-    } catch (err: any) {
-      showAlert({ type: "error", title: "Erreur d'envoi", message: err.message || "Impossible d'envoyer la demande. Vérifiez votre connexion et réessayez.", buttons: [{ text: "OK", style: "primary" }] });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Impossible d'envoyer la demande. Vérifiez votre connexion et réessayez.";
+      showAlert({ type: "error", title: "Erreur d'envoi", message: msg, buttons: [{ text: "OK", style: "primary" }] });
     } finally {
       setSubmitting(false);
     }
