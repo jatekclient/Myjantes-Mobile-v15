@@ -20,6 +20,7 @@
       }
     },
     "production": {
+      "distribution": "store",
       "autoIncrement": false,
       "channel": "production"
     }
