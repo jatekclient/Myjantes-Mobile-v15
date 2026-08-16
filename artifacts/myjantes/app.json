@@ -91,9 +91,7 @@
       "typedRoutes": true,
       "reactCompiler": true
     },
-    "runtimeVersion": {
-      "policy": "appVersion"
-    },
+    "runtimeVersion": "2.15.8",
     "updates": {
       "url": "https://u.expo.dev/d92b0b61-9702-4b0c-a9a8-dee797b95983",
       "enabled": true,

@@ -194,9 +194,26 @@ export default function QuoteDetailScreen() {
   const expiryDate = (quote as any).expiryDate || (quote as any).validUntil;
   const displayRef = (quote as any).reference || (quote as any).quoteNumber || quote.id;
   const rawRequestDetails = (quote as any).requestDetails || (quote as any).description || "";
-  const requestDetails = typeof rawRequestDetails === "object"
-    ? (rawRequestDetails.message || rawRequestDetails.details || JSON.stringify(rawRequestDetails))
-    : String(rawRequestDetails);
+  function extractRequestText(raw: any): string {
+    if (!raw) return "";
+    if (typeof raw === "string") {
+      // Peut être une chaîne JSON — tenter de parser
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") return extractRequestText(parsed);
+      } catch {}
+      return raw;
+    }
+    if (typeof raw === "object") {
+      // Champs texte explicites en priorité
+      const text = raw.text || raw.message || raw.details || raw.notes || raw.description || raw.comment || "";
+      if (text) return String(text);
+      // Pas de champ texte → ignorer les champs non lisibles et ne pas afficher du JSON brut
+      return "";
+    }
+    return String(raw);
+  }
+  const requestDetails = extractRequestText(rawRequestDetails);
   const serviceName = (quote as any).service?.name || (quote as any).serviceName || "";
   const clientInfo = (quote as any).client || null;
   const quoteServiceId = (quote as any).serviceId || (quote as any).service?.id;

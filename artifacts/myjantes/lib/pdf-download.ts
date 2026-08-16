@@ -92,9 +92,22 @@ export async function viewPdf(
           );
         }
 
+        // Le serveur peut retourner JSON avec { url } au lieu d'un binaire PDF
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("application/json") || contentType.includes("text/json")) {
+          const json = await response.json();
+          const redirectUrl: string | undefined =
+            json?.url || json?.pdfUrl || json?.pdf_url || json?.downloadUrl || json?.link || json?.href;
+          if (redirectUrl) {
+            window.open(redirectUrl, "_blank");
+            return true;
+          }
+          throw new Error(json?.message || json?.error || "Le serveur n'a pas retourné de PDF.");
+        }
+
         const blob = await response.blob();
         if (!blob || blob.size === 0) {
-          throw new Error("PDF vide reçu");
+          throw new Error("PDF vide reçu du serveur.");
         }
 
         const blobUrl = URL.createObjectURL(blob);
@@ -128,9 +141,52 @@ export async function viewPdf(
         );
       }
 
+      // Détecter si le serveur a retourné du JSON au lieu d'un PDF
+      // (certains backends retournent { url: "..." } plutôt que le binaire)
+      const headers = result.headers as Record<string, string> | undefined;
+      const respContentType = headers?.["content-type"] || headers?.["Content-Type"] || "";
+      if (respContentType.includes("application/json") || respContentType.includes("text/json")) {
+        // Lire le fichier comme texte pour extraire l'URL
+        const jsonText = await FileSystem.readAsStringAsync(filePath);
+        try {
+          const json = JSON.parse(jsonText);
+          const redirectUrl: string | undefined =
+            json?.url || json?.pdfUrl || json?.pdf_url || json?.downloadUrl || json?.link || json?.href;
+          if (redirectUrl) {
+            await WebBrowser.openBrowserAsync(redirectUrl);
+            return true;
+          }
+          throw new Error(json?.message || json?.error || "Le serveur n'a pas retourné de PDF.");
+        } catch (parseErr: any) {
+          throw new Error(parseErr?.message || "Réponse du serveur inattendue.");
+        }
+      }
+
+      // Vérification de sécurité : lire les premiers octets pour détecter JSON
+      // même si content-type est absent ou incorrect
       const fileInfo = await FileSystem.getInfoAsync(filePath);
       if (!fileInfo.exists || !fileInfo.size || fileInfo.size === 0) {
-        throw new Error("PDF vide reçu");
+        throw new Error("PDF vide reçu du serveur.");
+      }
+
+      if (fileInfo.size < 200_000) {
+        // Fichier assez petit pour un contrôle rapide
+        const preview = await FileSystem.readAsStringAsync(filePath, { length: 10 });
+        if (preview.trimStart().startsWith("{") || preview.trimStart().startsWith("[")) {
+          const fullText = await FileSystem.readAsStringAsync(filePath);
+          try {
+            const json = JSON.parse(fullText);
+            const redirectUrl: string | undefined =
+              json?.url || json?.pdfUrl || json?.pdf_url || json?.downloadUrl || json?.link || json?.href;
+            if (redirectUrl) {
+              await WebBrowser.openBrowserAsync(redirectUrl);
+              return true;
+            }
+            throw new Error(json?.message || json?.error || "Le serveur n'a pas retourné de PDF.");
+          } catch (parseErr: any) {
+            throw new Error(parseErr?.message || "Réponse JSON inattendue du serveur.");
+          }
+        }
       }
 
       await Sharing.shareAsync(result.uri, {
