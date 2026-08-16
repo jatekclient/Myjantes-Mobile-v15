@@ -1,3 +1,4 @@
 - [MyJantes Expo port lessons](myjantes-port.md) — key pitfalls fixed during the MyJantes port to multi-artifact workspace.
 - [MyJantes app architecture](myjantes-architecture.md) — mobile = pure frontend, all data via backend, no local business logic, explicit errors on endpoint failure.
+- [MyJantes OTA (EAS Update)](myjantes-ota.md) — canal preview configuré ; les APK antérieurs à expo-updates ne reçoivent jamais d'OTA, un rebuild unique est requis.
 - [MyJantes API config](myjantes-api-config.md) — production API is api.myjantes.fr; ALLOWED_PARENT_DOMAIN must match; wildcard routes use {*key} syntax in Express 5.
